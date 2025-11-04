@@ -1,0 +1,20 @@
+name: GALLANT-WS3
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - jupyterlab
+  - ipykernel
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - geopandas
+  - shapely
+  - pyproj
+  - rtree
+  - fiona
+  - gdal
+  - rasterio
+  - tqdm 
