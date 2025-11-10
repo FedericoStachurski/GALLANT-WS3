@@ -18,3 +18,5 @@ dependencies:
   - gdal
   - rasterio
   - tqdm 
+  - openpyxl
+  - geodatasets
