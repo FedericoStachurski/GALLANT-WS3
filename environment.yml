@@ -21,7 +21,10 @@ dependencies:
   - openpyxl
   - geodatasets
   - python-dateutil
-  - torch 
+  - torch
   - peft
   - openai
   - faiss-cpu
+  - msal
+  - requests
+  - pillow
