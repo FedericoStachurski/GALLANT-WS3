@@ -21,3 +21,5 @@ dependencies:
   - openpyxl
   - geodatasets
   - python-dateutil
+  - torch 
+  - peft
