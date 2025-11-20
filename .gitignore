@@ -1,0 +1,32 @@
+# notebooks/*.ipynb
+!.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+# notebooks/
+projects/Flickr_proj/models/
+*__pycache__*/
+/projects/utilities_scr/__pycache__/
+
+temp_scr_communimap/
+notebooks/images_GIS_hub/
+
+
+# Ignore environment files
+# /environment.yml
+/conda-env.yml
+/requirements.txt
+/requirements-dev.txt
+/poetry.lock
+/pyproject.toml
+/.venv/
+/.mypy_cache/
+/__pycache__/
+/*.pyc
+/*.pyo
+/*.pyd
+/*.env
+/*.sqlite3
+/*.db
+/*.log
