@@ -1,0 +1,1 @@
+from . import build_caption_model_adaptor
