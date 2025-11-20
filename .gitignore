@@ -11,7 +11,7 @@ projects/Flickr_proj/models/
 
 temp_scr_communimap/
 notebooks/images_GIS_hub/
-
+*ipynb
 
 # Ignore environment files
 # /environment.yml
