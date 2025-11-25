@@ -1,10 +1,10 @@
-# notebooks/*.ipynb
+notebooks/*.ipynb
 !.vscode/*
 !.vscode/settings.json
 !.vscode/launch.json
 !.vscode/tasks.json
 !.vscode/extensions.json
-# notebooks/
+notebooks/
 projects/Flickr_proj/models/
 *__pycache__*/
 /projects/utilities_scr/__pycache__/

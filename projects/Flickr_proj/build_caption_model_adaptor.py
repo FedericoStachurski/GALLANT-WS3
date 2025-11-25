@@ -16,15 +16,21 @@ from tqdm import tqdm
 
 
 def build_caption_from_row(row) -> str:
-    title = str(row.get("title", "")).strip()
-    tags = str(row.get("tags", "")).strip() if "tags" in row else ""
+    # Prefer description if present, else fallback to title
+    desc = str(row.get("description", "")).strip()
+    title = desc if desc else str(row.get("title", "")).strip()
 
+    # Your original tag logic unchanged
+    tags = str(row.get("tags", "")).strip() if "tags" in row else ""
     tags_list = [t for t in tags.split() if t.lower() != "glasgow"]
     extra = " ".join(tags_list[:3])
 
+    # Same return logic as before
     if extra:
         return f"{title}. {extra}".strip()
+
     return title
+
 
 
 class ImageCaptioningDataset(Dataset):
