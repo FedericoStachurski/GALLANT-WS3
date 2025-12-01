@@ -4,11 +4,17 @@ load_data_communimap.py
 
 Usage:
     from load_data_communimap import load_communimap_data
-    df = load_communimap_data("/path/to/communimap_spots.csv")
+    df = load_communimap_data("/path/to/communimap_spots.csv", use_blip=True)
 """
 
 import pandas as pd
 import numpy as np
+
+# Optional: only import BLIP stuff if needed
+from PIL import Image
+import requests
+from io import BytesIO
+from transformers import BlipProcessor, BlipForConditionalGeneration
 
 
 def sniff_delimiter(path):
@@ -26,7 +32,6 @@ def load_raw_dataframe(path):
     Attempts to load the CSV with auto-detected delimiter.
     Falls back to comma or semicolon if needed.
     """
-    # First attempt: let pandas sniff
     try:
         df = pd.read_csv(path, sep=None, engine="python")
         return df
@@ -54,12 +59,10 @@ def pick_primary_image(row, media_cols):
       1. IMAGE column if present
       2. Otherwise first non-empty MEDIA_* column
     """
-    # Prefer the main IMAGE column
     img = row.get("IMAGE")
     if isinstance(img, str) and img.strip():
         return img.strip()
 
-    # Fallback to any MEDIA_* column
     for col in media_cols:
         val = row.get(col)
         if isinstance(val, str) and val.strip():
@@ -68,11 +71,92 @@ def pick_primary_image(row, media_cols):
     return None
 
 
-def load_communimap_data(path):
+# ---------- BLIP utils ----------
+
+_BLIP_LOADED = False
+_BLIP_PROCESSOR = None
+_BLIP_MODEL = None
+BLIP_MODEL_NAME = "Salesforce/blip-image-captioning-base"
+
+
+def _load_blip():
+    global _BLIP_LOADED, _BLIP_PROCESSOR, _BLIP_MODEL
+    if _BLIP_LOADED:
+        return _BLIP_PROCESSOR, _BLIP_MODEL
+    print(f"[BLIP] Loading model: {BLIP_MODEL_NAME}")
+    _BLIP_PROCESSOR = BlipProcessor.from_pretrained(BLIP_MODEL_NAME)
+    _BLIP_MODEL = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL_NAME)
+    _BLIP_LOADED = True
+    return _BLIP_PROCESSOR, _BLIP_MODEL
+
+
+def _download_image(url, timeout=5):
+    if not isinstance(url, str) or not url.strip():
+        return None
+    try:
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+        img = Image.open(BytesIO(resp.content)).convert("RGB")
+        return img
+    except Exception as e:
+        print(f"[BLIP] Failed to download {url}: {e}")
+        return None
+
+
+def _caption_image_blip(image, processor, model, max_new_tokens=40):
+    inputs = processor(images=image, return_tensors="pt")
+    out = model.generate(**inputs, max_new_tokens=max_new_tokens)
+    caption = processor.decode(out[0], skip_special_tokens=True)
+    return caption.strip()
+
+
+def fill_missing_text_with_blip(df, min_len=40, max_rows=None):
+    """
+    For rows where df['text'] is missing/short AND a primary_image exists,
+    generate a caption with BLIP and overwrite df['text'].
+
+    min_len: minimum length to consider text "good enough".
+    max_rows: optionally limit number of rows to caption (for testing).
+    """
+    processor, model = _load_blip()
+
+    texts = df["text"].fillna("").astype(str)
+    needs_caption = (
+        (texts.str.len() < min_len)
+        & df["primary_image"].notna()
+        & df["primary_image"].astype(str).str.strip().ne("")
+    )
+
+    indices = np.where(needs_caption.values)[0]
+    if max_rows is not None:
+        indices = indices[:max_rows]
+
+    print(f"[BLIP] Will caption {len(indices)} rows (min_len={min_len}).")
+
+    for idx in indices:
+        url = df.loc[idx, "primary_image"]
+        img = _download_image(url)
+        if img is None:
+            continue
+        try:
+            caption = _caption_image_blip(img, processor, model)
+            if caption:
+                df.at[idx, "text"] = caption
+                print(f"[BLIP] Row {idx}: {caption}")
+        except Exception as e:
+            print(f"[BLIP] Caption failed for row {idx}: {e}")
+
+    return df
+
+
+def load_communimap_data(path, use_blip=False, blip_min_len=40, blip_max_rows=None):
     """
     Loads, cleans, and structures CommuniMap spot data into:
 
-    id, text, lat, lon, primary_image
+        id, text, LATITUDE, LONGITUDE, primary_image
+
+    If use_blip=True, rows with missing/very short text but with an image
+    will get a BLIP-generated caption used as text.
 
     Returns a cleaned pandas DataFrame.
     """
@@ -85,12 +169,11 @@ def load_communimap_data(path):
     # Identify media columns
     media_cols = [c for c in df.columns if c.startswith("MEDIA_")]
 
-    # Core columns we need (some may not exist in all rows)
     needed = {"DESCRIPTION", "LATITUDE", "LONGITUDE", "IMAGE"}
     missing_cols = needed - set(df.columns)
-
     if missing_cols:
         print(f"Warning: Missing expected columns: {missing_cols}")
+        raise ValueError("Input CSV missing required columns.")
 
     # Build the primary_image column
     df["primary_image"] = df.apply(
@@ -98,14 +181,21 @@ def load_communimap_data(path):
         axis=1
     )
 
-    # Build the text field
+    # Initial text from DESCRIPTION
     df["text"] = df["DESCRIPTION"].fillna("").astype(str).str.strip()
+
+    # Optionally use BLIP to fill missing/short text
+    if use_blip:
+        df = fill_missing_text_with_blip(
+            df,
+            min_len=blip_min_len,
+            max_rows=blip_max_rows,
+        )
 
     # Drop rows with no coordinates or no usable text
     mask = (
-        df["LATITUDE"].notna() &
-        df["LONGITUDE"].notna() &
-        (df["text"].str.len() > 0)
+        df["LATITUDE"].notna()
+        & df["LONGITUDE"].notna()
     )
 
     clean = df[mask].copy().reset_index(drop=True)
@@ -113,7 +203,7 @@ def load_communimap_data(path):
     # Create id column (if no id exists)
     clean["id"] = clean.index.astype(str)
 
-    # Keep only the columns needed downstream
+    # Keep only columns needed downstream
     clean = clean[["id", "text", "LATITUDE", "LONGITUDE", "primary_image"]]
 
     print(f"Cleaned dataset: {clean.shape[0]} usable rows.")
@@ -124,10 +214,12 @@ def load_communimap_data(path):
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) != 2:
-        print("Usage: python load_data_communimap.py <path_to_csv>")
+    if len(sys.argv) < 2:
+        print("Usage: python load_data_communimap.py <path_to_csv> [--blip]")
         sys.exit(1)
 
     path = sys.argv[1]
-    df = load_communimap_data(path)
+    use_blip = ("--blip" in sys.argv)
+
+    df = load_communimap_data(path, use_blip=use_blip)
     print(df.head().to_string())
