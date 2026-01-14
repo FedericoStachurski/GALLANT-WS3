@@ -28,3 +28,9 @@ dependencies:
   - msal
   - requests
   - pillow
+  - sentence-transformers
+  - pip
+  - pip:
+      - transformers
+      - datasets
+      - diffusers   
