@@ -167,8 +167,8 @@ def main():
     # -------------------------
     # Load query encoders
     # -------------------------
-    # Text encoder (MiniLM) — must match TEXT_MODEL_NAME used for text embeddings
-    QUERY_TEXT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+    # Text encoder (CLIP) — must match TEXT_MODEL_NAME used for text embeddings
+    QUERY_TEXT_MODEL = "sentence-transformers/clip-ViT-B-32"
     print(f"[MODEL] Loading TEXT query encoder:  {QUERY_TEXT_MODEL}")
     model_text = SentenceTransformer(QUERY_TEXT_MODEL)
 
@@ -284,6 +284,8 @@ def main():
             html = f"""
             <div style="width:240px;">
             <b>Score: {score:.3f}</b><br>
+            <b>Text Score: {r["score_text"]:.3f}</b><br>
+            <b>Image Score: {r["score_img"]:.3f}</b><br>
             <p style="font-size:11px;">{text}</p>
             {'<img src="' + img + '" width="220">' if img else ''}
             </div>

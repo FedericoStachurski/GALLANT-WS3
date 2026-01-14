@@ -37,7 +37,7 @@ from load_data_communimap import load_communimap_data
 
 
 # === CONFIG ===
-TEXT_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+TEXT_MODEL_NAME = "sentence-transformers/clip-ViT-B-32"  # Changed to CLIP for joint embedding space
 IMAGE_MODEL_NAME = "sentence-transformers/clip-ViT-B-32"
 BLIP_MODEL_NAME = "Salesforce/blip-image-captioning-base"
 
