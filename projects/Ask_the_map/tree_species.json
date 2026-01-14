@@ -1,0 +1,212 @@
+{
+  "source": "Glasgow City Council – Suggested Tree Species",
+  "version": "v1",
+  "trees": [
+    {
+      "size_class": "large",
+      "genus": "Fraxinus",
+      "species": [
+        { "name": "Fraxinus excelsior", "evergreen": false },
+        { "name": "Fraxinus excelsior 'Westhof Glorie'", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "large",
+      "genus": "Quercus",
+      "species": [
+        { "name": "Quercus cerris", "evergreen": false },
+        { "name": "Quercus rubra", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "large",
+      "genus": "Fagus",
+      "species": [
+        { "name": "Fagus sylvatica", "evergreen": false },
+        { "name": "Fagus sylvatica 'Dawyck'", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "large",
+      "genus": "Tilia",
+      "species": [
+        { "name": "Tilia cordata 'Green Spire'", "evergreen": false },
+        { "name": "Tilia cordata 'Swedish Upright'", "evergreen": false },
+        { "name": "Tilia platyphyllos 'Fastigiata'", "evergreen": false },
+        { "name": "Tilia platyphyllos 'Rubra'", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "large",
+      "genus": "Acer",
+      "species": [
+        { "name": "Acer platanoides", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "large",
+      "genus": "Aesculus",
+      "species": [
+        { "name": "Aesculus hippocastanum", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "large",
+      "genus": "Pinus",
+      "species": [
+        { "name": "Pinus sylvestris", "evergreen": true }
+      ]
+    },
+    {
+      "size_class": "large",
+      "genus": "Larix",
+      "species": [
+        { "name": "Larix spp", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "medium",
+      "genus": "Sorbus",
+      "species": [
+        { "name": "Sorbus aucuparia", "evergreen": false },
+        { "name": "Sorbus aucuparia 'Asplenifolia'", "evergreen": false },
+        { "name": "Sorbus 'Joseph Rock'", "evergreen": false },
+        { "name": "Sorbus 'Embley'", "evergreen": false },
+        { "name": "Sorbus vilmorinii", "evergreen": false },
+        { "name": "Sorbus aria", "evergreen": false },
+        { "name": "Sorbus aria 'Lutescens'", "evergreen": false },
+        { "name": "Sorbus aria 'Majestica'", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "medium",
+      "genus": "Betula",
+      "species": [
+        { "name": "Betula pendula", "evergreen": false },
+        { "name": "Betula pubescens", "evergreen": false },
+        { "name": "Betula jacquemontii", "evergreen": false },
+        { "name": "Betula 'Dalecarlica'", "evergreen": false },
+        { "name": "Betula papyrifera", "evergreen": false },
+        { "name": "Betula utilis", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "medium",
+      "genus": "Fraxinus",
+      "species": [
+        { "name": "Fraxinus oxycarpa 'Raywood'", "evergreen": false },
+        { "name": "Fraxinus ornus", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "medium",
+      "genus": "Carpinus",
+      "species": [
+        { "name": "Carpinus betulus 'Fastigiata'", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "medium",
+      "genus": "Laburnum",
+      "species": [
+        { "name": "Laburnum vossii", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "medium",
+      "genus": "Pyrus",
+      "species": [
+        { "name": "Pyrus salicifolia 'Pendula'", "evergreen": false },
+        { "name": "Pyrus calleryiana 'Chanticleer'", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "small",
+      "genus": "Prunus",
+      "species": [
+        { "name": "Prunus cerasifera 'Nigra'", "evergreen": false },
+        { "name": "Prunus × hillieri 'Spire'", "evergreen": false },
+        { "name": "Prunus dulcis 'Erecta'", "evergreen": false },
+        { "name": "Prunus 'Pandora'", "evergreen": false },
+        { "name": "Prunus 'Accolade'", "evergreen": false },
+        { "name": "Prunus subhirtella 'Autumnalis'", "evergreen": false },
+        { "name": "Prunus serrula'", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "small",
+      "genus": "Malus",
+      "species": [
+        { "name": "Malus 'Katherine'", "evergreen": false },
+        { "name": "Malus 'van Eseltine'", "evergreen": false },
+        { "name": "Malus 'Golden Hornet'", "evergreen": false },
+        { "name": "Malus 'Liset'", "evergreen": false },
+        { "name": "Malus floribunda", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "small",
+      "genus": "Sorbus",
+      "species": [
+        { "name": "Sorbus 'Apricot Lady'", "evergreen": false },
+        { "name": "Sorbus cashmiriana", "evergreen": false },
+        { "name": "Sorbus discolor", "evergreen": false },
+        { "name": "Sorbus 'Sheerwater Seedling'", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "small",
+      "genus": "Crataegus",
+      "species": [
+        { "name": "Crataegus crus-gali", "evergreen": false },
+        { "name": "Crataegus × grignonensis", "evergreen": false },
+        { "name": "Crataegus monogyna", "evergreen": false },
+        { "name": "Crataegus monogyna 'Stricta'", "evergreen": false },
+        { "name": "Crataegus prunifolia", "evergreen": false },
+        { "name": "Crataegus 'Paul's Scarlet'", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "small",
+      "genus": "Acer",
+      "species": [
+        { "name": "Acer griseum", "evergreen": false },
+        { "name": "Acer pseudoplatanus 'Brilliantissimum'", "evergreen": false },
+        { "name": "Acer rufinerve", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "small",
+      "genus": "Amelanchier",
+      "species": [
+        { "name": "Amelanchier laevis", "evergreen": false }
+      ]
+    },
+    {
+      "size_class": "evergreen",
+      "genus": "Ilex",
+      "species": [
+        { "name": "Ilex altaclarensis 'Golden King'", "evergreen": true },
+        { "name": "Ilex aquifolium", "evergreen": true },
+        { "name": "Ilex aquifolium 'Golden Queen'", "evergreen": true },
+        { "name": "Ilex aquifolium 'J.C. Van Tol'", "evergreen": true }
+      ]
+    },
+    {
+      "size_class": "evergreen",
+      "genus": "Taxus",
+      "species": [
+        { "name": "Taxus baccata", "evergreen": true },
+        { "name": "Taxus baccata 'Elegantissima'", "evergreen": true },
+        { "name": "Taxus baccata 'Fastigiata'", "evergreen": true }
+      ]
+    },
+    {
+      "size_class": "medium",
+      "genus": "Parrotia",
+      "species": [
+        { "name": "Parrotia persica", "evergreen": false }
+      ]
+    }
+  ]
+}
