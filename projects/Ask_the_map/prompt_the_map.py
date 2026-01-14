@@ -28,6 +28,10 @@ import faiss
 import folium
 from folium.plugins import HeatMap
 from sentence_transformers import SentenceTransformer
+import requests
+from PIL import Image
+import io
+import bisect
 
 
 # -------------------------------------------------
@@ -37,6 +41,19 @@ def normalize_rows(mat: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(mat, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     return mat / norms
+
+
+def download_image(url, save_path, timeout=7):
+    if not isinstance(url, str) or not url.strip():
+        return False
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        img.save(save_path)
+        return True
+    except Exception:
+        return False
 
 
 def build_parser():
@@ -167,23 +184,29 @@ def main():
     # -------------------------
     # Load query encoders
     # -------------------------
-    # Text encoder (CLIP) — must match TEXT_MODEL_NAME used for text embeddings
-    QUERY_TEXT_MODEL = "sentence-transformers/clip-ViT-B-32"
+    # Query encoder — text uses MiniLM, image uses CLIP
+    QUERY_TEXT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
     print(f"[MODEL] Loading TEXT query encoder:  {QUERY_TEXT_MODEL}")
     model_text = SentenceTransformer(QUERY_TEXT_MODEL)
 
-    # Image-side encoder (CLIP from sentence-transformers, same as IMAGE_MODEL_NAME)
+    # Image-side encoder (CLIP)
     QUERY_IMG_MODEL = "sentence-transformers/clip-ViT-B-32"
     print(f"[MODEL] Loading IMAGE query encoder: {QUERY_IMG_MODEL}")
     model_img = SentenceTransformer(QUERY_IMG_MODEL)
 
     def embed_query_text(q: str) -> np.ndarray:
-        vec = model_text.encode([q], convert_to_numpy=True).astype("float32")
+        # Truncate query to ~50 words to avoid model truncation issues
+        words = q.split()[:50]
+        truncated_q = ' '.join(words)
+        vec = model_text.encode([truncated_q], convert_to_numpy=True).astype("float32")
         return normalize_rows(vec)  # shape (1, dim_t)
 
     def embed_query_img(q: str) -> np.ndarray:
-        # CLIP text encoder via SentenceTransformer(clip-ViT-B-32)
-        vec = model_img.encode([q], convert_to_numpy=True).astype("float32")
+        # Truncate query to ~50 words to avoid CLIP truncation issues
+        words = q.split()[:50]
+        truncated_q = ' '.join(words)
+        # CLIP text encoder
+        vec = model_img.encode([truncated_q], convert_to_numpy=True).astype("float32")
         return normalize_rows(vec)  # shape (1, dim_i)
 
     # -------------------------
@@ -209,27 +232,44 @@ def main():
         # Union of candidate indices
         candidate_idxs = set(score_text_dict.keys()).union(score_img_dict.keys())
 
+        # Compute percentile normalization per modality over candidates
+        text_scores = sorted(score_text_dict.values())
+        img_scores = sorted(score_img_dict.values())
+        
+        def get_percentile(score, scores_list):
+            if not scores_list:
+                return 0.0
+            pos = bisect.bisect_left(scores_list, score)
+            return pos / len(scores_list) if scores_list else 0.0
+
         fused = []
         for idx in candidate_idxs:
             st = score_text_dict.get(idx, 0.0)
             si = score_img_dict.get(idx, 0.0)
-            s  = w_text * st + w_img * si
+            
+            # Percentile normalize
+            p_text = 100* get_percentile(st, text_scores)
+            p_img = 100* get_percentile(si, img_scores)
+
+            s = w_text * st + w_img * si
             if s < threshold:
                 continue
-            fused.append((idx, s, st, si))
+            fused.append((idx, s, st, si, p_text, p_img))
 
         # Sort by fused score descending
         fused.sort(key=lambda x: x[1], reverse=True)
 
         # Build result objects
         results = []
-        for idx, s_fused, st, si in fused[:k]:
+        for idx, s_fused, st, si, p_text, p_img in fused[:k]:
             item = meta[idx]
             results.append({
                 "idx": int(idx),
                 "score": float(s_fused),
                 "score_text": float(st),
                 "score_img": float(si),
+                "p_text": float(p_text),
+                "p_img": float(p_img),
                 "id": item["id"],
                 "text": item.get("text", ""),
                 "lat": float(item["lat"]),
@@ -284,8 +324,8 @@ def main():
             html = f"""
             <div style="width:240px;">
             <b>Score: {score:.3f}</b><br>
-            <b>Text Score: {r["score_text"]:.3f}</b><br>
-            <b>Image Score: {r["score_img"]:.3f}</b><br>
+            <b>Text Score: {r["score_text"]:.3f} (p: {r["p_text"]:.3f} %)</b><br>
+            <b>Image Score: {r["score_img"]:.3f} (p: {r["p_img"]:.3f} %)</b><br>
             <p style="font-size:11px;">{text}</p>
             {'<img src="' + img + '" width="220">' if img else ''}
             </div>
@@ -384,6 +424,25 @@ def main():
         m.save(MAP_PATH)
 
         print(f"[MAP] Saved to: {MAP_PATH}\n(Refresh in your browser.)\n")
+
+        # Ask to save images
+        save_images = input("Save images to folder? (y/n): ").strip().lower()
+        if save_images in {"y", "yes"}:
+            map_name = os.path.splitext(os.path.basename(MAP_PATH))[0]
+            folder_name = f"save_images_{q.replace(' ', '_')[:20]}_{map_name}"
+            full_folder_path = os.path.join("/home/fss6k/embedded_data_CM/query_maps", folder_name)
+            os.makedirs(full_folder_path, exist_ok=True)
+            saved_count = 0
+            for r in results:
+                img_url = r.get("image")
+                if img_url:
+                    filename = f"{r['id']}.jpg"
+                    save_path = os.path.join(full_folder_path, filename)
+                    if download_image(img_url, save_path):
+                        saved_count += 1
+                    else:
+                        print(f"Failed to save {img_url}")
+            print(f"[SAVE] Saved {saved_count} images to {full_folder_path}/\n")
 
 
 if __name__ == "__main__":

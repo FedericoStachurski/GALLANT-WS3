@@ -37,7 +37,7 @@ from load_data_communimap import load_communimap_data
 
 
 # === CONFIG ===
-TEXT_MODEL_NAME = "sentence-transformers/clip-ViT-B-32"  # Changed to CLIP for joint embedding space
+TEXT_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # MiniLM for text
 IMAGE_MODEL_NAME = "sentence-transformers/clip-ViT-B-32"
 BLIP_MODEL_NAME = "Salesforce/blip-image-captioning-base"
 
@@ -71,20 +71,20 @@ def load_blip():
     return processor, model, device
 
 
-def caption_image_blip(image, processor, model, device, max_new_tokens=40):
+def caption_image_blip(image, processor, model, device, max_new_tokens=20):
     # image is a PIL.Image
     inputs = processor(images=image, return_tensors="pt").to(device)
 
     with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=max_new_tokens)
+        out = model.generate(**inputs, max_new_tokens=max_new_tokens, no_repeat_ngram_size=3, do_sample=True, temperature=0.7)
 
     caption = processor.decode(out[0], skip_special_tokens=True)
     return caption.strip()
 
-def caption_batch_blip(images, processor, model, device, max_new_tokens=40):
+def caption_batch_blip(images, processor, model, device, max_new_tokens=20):
     inputs = processor(images=images, return_tensors="pt").to(device)
     with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=max_new_tokens)
+        out = model.generate(**inputs, max_new_tokens=max_new_tokens, no_repeat_ngram_size=3, do_sample=True, temperature=0.7)
     captions = [
         processor.decode(seq, skip_special_tokens=True).strip()
         for seq in out
@@ -94,7 +94,7 @@ def caption_batch_blip(images, processor, model, device, max_new_tokens=40):
 
 
 
-def fill_short_descriptions_with_blip(df, batch_size: int = 1, max_new_tokens: int = 40):
+def fill_short_descriptions_with_blip(df, batch_size: int = 1, max_new_tokens: int = 20):
     """
     Replace missing/short text using BLIP captioning.
 
@@ -393,6 +393,8 @@ def main():
     df = fill_short_descriptions_with_blip(df, batch_size=BLIP_BATCH)
 
     texts = df["text"].tolist()
+    # Truncate texts to ~50 words for consistency with query processing
+    texts = [' '.join(t.split()[:50]) for t in texts]
     imgs = df["primary_image"].tolist()
     ids = df["id"].tolist()
     lats = df["LATITUDE"].tolist()
