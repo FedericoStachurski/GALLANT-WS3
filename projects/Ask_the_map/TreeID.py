@@ -1,461 +1,448 @@
-#!/usr/bin/env python3
-"""
-tree_pipeline_prototype.py
-
-Prototype pipeline:
-- Segment a "tree-like" region using SAM (if installed) + simple heuristics
-- Classify into functional categories with CLIP (robust)
-- Optionally suggest species with CLIP zero-shot (assistive)
-- Produce basic scorecards (indicative CO2 + runoff proxy) with uncertainty tiers
-
-Usage:
-  python tree_pipeline_prototype.py \
-    --image_dir /path/to/tree_photos \
-    --out_dir outputs \
-    --sam_checkpoint /path/to/sam_vit_h_4b8939.pth \
-    --device cuda
-
-If SAM isn't available or no checkpoint is provided, the script falls back to using the full image.
-"""
-
-from __future__ import annotations
-
-import argparse
-import csv
-import json
-import math
 import os
-from dataclasses import dataclass, asdict
+import sys
+import json
+import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 from PIL import Image
 
-import torch
-from transformers import CLIPModel, CLIPProcessor
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+from segment_anything import sam_model_registry, SamPredictor
+
+import open_clip
+from open_clip.tokenizer import HFTokenizer
 
 
-# ----------------------------
-# Config: labels & scorecards
-# ----------------------------
-
-DEFAULT_SPECIES_CANDIDATES = [
-    # UK-ish common urban trees (edit freely to fit your city)
-    "English oak (Quercus robur)",
-    "sessile oak (Quercus petraea)",
-    "London plane (Platanus × acerifolia)",
-    "sycamore (Acer pseudoplatanus)",
-    "field maple (Acer campestre)",
-    "silver birch (Betula pendula)",
-    "downy birch (Betula pubescens)",
-    "common lime (Tilia × europaea)",
-    "small-leaved lime (Tilia cordata)",
-    "horse chestnut (Aesculus hippocastanum)",
-    "beech (Fagus sylvatica)",
-    "ash (Fraxinus excelsior)",
-    "rowan (Sorbus aucuparia)",
-    "hawthorn (Crataegus monogyna)",
-    "holly (Ilex aquifolium)",
-    "Scots pine (Pinus sylvestris)",
-    "yew (Taxus baccata)",
-    "Norway spruce (Picea abies)",
-]
-
-# Functional category prompts (more robust than species)
-FUNCTIONAL_PROMPTS = {
-    "leaf_type": ["a photo of a broadleaf tree", "a photo of a conifer tree"],
-    "phenology": ["a photo of an evergreen tree", "a photo of a deciduous tree"],
-    "scene_view": ["a close-up photo of tree bark", "a photo of a tree canopy with leaves", "a photo of a whole tree"],
-}
-
-@dataclass
-class TreeResult:
-    image_name: str
-    used_sam: bool
-    mask_area_frac: float  # fraction of image pixels in selected mask
-    mask_green_score: float  # heuristic
-    functional_leaf_type: str
-    functional_leaf_type_p: float
-    functional_phenology: str
-    functional_phenology_p: float
-    view_type: str
-    view_type_p: float
-    top_species: str
-    top_species_p: float
-    top_species_list_json: str
-    confidence_tier: str
-    scorecard_json: str
+# -----------------------------
+# Utils
+# -----------------------------
+def ask(prompt: str, default: Optional[str] = None) -> str:
+    if default is None:
+        return input(prompt).strip()
+    s = input(f"{prompt} [{default}] ").strip()
+    return s if s else default
 
 
-# ----------------------------
-# Helper: CLIP zero-shot
-# ----------------------------
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def list_images(folder: Path, exts: Tuple[str, ...]) -> List[Path]:
+    files = []
+    for e in exts:
+        files.extend(folder.glob(f"*{e}"))
+        files.extend(folder.glob(f"*{e.upper()}"))
+    return sorted(set(files))
+
+
+def clamp_box(box, W, H):
+    x0, y0, x1, y1 = map(int, box)
+    x0 = max(0, min(x0, W - 1))
+    x1 = max(0, min(x1, W - 1))
+    y0 = max(0, min(y0, H - 1))
+    y1 = max(0, min(y1, H - 1))
+    if x1 < x0:
+        x0, x1 = x1, x0
+    if y1 < y0:
+        y0, y1 = y1, y0
+    return [x0, y0, x1, y1]
+
+
+# -----------------------------
+# GroundingDINO selection logic
+# (your heuristic, wrapped)
+# -----------------------------
+def select_tree_box(
+    detections: Dict[str, Any],
+    image_size: Tuple[int, int],
+    score_min: float = 0.25
+) -> Optional[List[int]]:
+    W, H = image_size
+    best_box, best_s = None, -1.0
+
+    for box, score in zip(detections["boxes"], detections["scores"]):
+        s = float(score)
+        if s < score_min:
+            continue
+
+        x0, y0, x1, y1 = box.tolist()
+        w, h = (x1 - x0), (y1 - y0)
+        if w <= 1 or h <= 1:
+            continue
+
+        area = w * h
+
+        touch = (x0 < 5) + (y0 < 5) + (x1 > W - 5) + (y1 > H - 5)
+        edge_penalty = 0.65 ** touch
+
+        aspect = max(w / h, h / w)
+        aspect_penalty = 1.0 if aspect < 6 else 0.5
+
+        score_combined = (area * s) * edge_penalty * aspect_penalty
+
+        if score_combined > best_s:
+            best_s = score_combined
+            best_box = [int(x0), int(y0), int(x1), int(y1)]
+
+    if best_box is None:
+        return None
+    return clamp_box(best_box, W, H)
+
+
+def draw_selected_box(ax, box, label="SELECTED"):
+    x0, y0, x1, y1 = box
+    rect = patches.Rectangle(
+        (x0, y0),
+        x1 - x0,
+        y1 - y0,
+        linewidth=3,
+        edgecolor="lime",
+        facecolor="none"
+    )
+    ax.add_patch(rect)
+    ax.text(
+        x0,
+        max(y0 - 12, 0),
+        label,
+        color="lime",
+        fontsize=12,
+        backgroundcolor="black"
+    )
+
+
+def expand_box(box: List[int], image_shape, pad: int = 50) -> List[int]:
+    H, W = image_shape[:2]
+    x0, y0, x1, y1 = map(int, box)
+    return [
+        max(0, x0 - pad),
+        max(0, y0 - pad),
+        min(W - 1, x1 + pad),
+        min(H - 1, y1 + pad),
+    ]
+
+
+# -----------------------------
+# BioCLIP helpers (your logic)
+# -----------------------------
+def clean_species_name(name: str) -> str:
+    name2 = re.sub(r"\s*'[^']+'", "", name)
+    name2 = name2.replace("×", "x")
+    return " ".join(name2.split()).strip()
+
+
+def flatten_glasgow_tree_list(glasgow: dict) -> List[Dict[str, Any]]:
+    candidates = []
+    for block in glasgow["trees"]:
+        size_class = block.get("size_class")
+        genus = block.get("genus")
+        for sp in block.get("species", []):
+            candidates.append({
+                "name": sp["name"],
+                "genus": genus,
+                "size_class": size_class,
+                "evergreen": sp.get("evergreen", None),
+            })
+    return candidates
+
 
 @torch.inference_mode()
-def clip_zero_shot(
-    model: CLIPModel,
-    processor: CLIPProcessor,
-    image: Image.Image,
-    prompts: List[str],
+def bioclip_rank_species(
+    pil_img: Image.Image,
+    candidates: List[Dict[str, Any]],
+    model,
+    preprocess,
+    tokenizer,
     device: str,
-) -> Tuple[List[float], int]:
-    """Returns probabilities for each prompt and argmax index."""
-    inputs = processor(text=prompts, images=image, return_tensors="pt", padding=True).to(device)
-    outputs = model(**inputs)
-    # CLIP returns logits per (image, text)
-    logits = outputs.logits_per_image[0]  # shape: (num_prompts,)
-    probs = logits.softmax(dim=-1).detach().cpu().numpy().tolist()
-    best_idx = int(np.argmax(probs))
-    return probs, best_idx
+    topk: int = 10
+) -> Tuple[List[Dict[str, Any]], List[Tuple[str, float]]]:
+
+    image_in = preprocess(pil_img).unsqueeze(0).to(device)
+
+    texts = []
+    owner = []
+    for j, c in enumerate(candidates):
+        full = c["name"]
+        clean = clean_species_name(full)
+        for variant in {full, clean}:
+            texts.append(f"a photo of {variant}")
+            owner.append(j)
+
+    text_tokens = tokenizer(texts).to(device)
+
+    img_f = model.encode_image(image_in)
+    txt_f = model.encode_text(text_tokens)
+
+    img_f = img_f / img_f.norm(dim=-1, keepdim=True)
+    txt_f = txt_f / txt_f.norm(dim=-1, keepdim=True)
+
+    probs = ((img_f @ txt_f.T) * 100.0).softmax(dim=-1)[0].detach().cpu().numpy()
+
+    cand_probs = np.zeros(len(candidates), dtype=np.float64)
+    for p, j in zip(probs, owner):
+        cand_probs[j] += float(p)
+
+    idx = cand_probs.argsort()[::-1][:topk]
+    results = [{
+        "species": candidates[i]["name"],
+        "genus": candidates[i].get("genus"),
+        "size_class": candidates[i].get("size_class"),
+        "evergreen": candidates[i].get("evergreen"),
+        "p": float(cand_probs[i]),
+    } for i in idx]
+
+    genus_scores = {}
+    for i, p in enumerate(cand_probs):
+        g = candidates[i].get("genus") or "UNKNOWN"
+        genus_scores[g] = genus_scores.get(g, 0.0) + float(p)
+    genus_rank = sorted(genus_scores.items(), key=lambda x: x[1], reverse=True)
+
+    return results, genus_rank
 
 
-# ----------------------------
-# Helper: Mask selection heuristics
-# ----------------------------
-
-def image_to_np_rgb(img: Image.Image) -> np.ndarray:
-    return np.array(img.convert("RGB"))
-
-def compute_green_score(rgb: np.ndarray, mask: np.ndarray) -> float:
-    """
-    Crude heuristic: trees often have lots of green pixels (not always! winter/bark shots will fail).
-    green_score in [0,1] roughly indicates "green dominance" within mask.
-    """
-    if mask.sum() < 10:
-        return 0.0
-    region = rgb[mask]
-    r, g, b = region[:, 0].astype(np.float32), region[:, 1].astype(np.float32), region[:, 2].astype(np.float32)
-    # "greenness": green greater than red & blue by margin
-    greenish = (g > r + 10) & (g > b + 10)
-    return float(greenish.mean())
-
-def pick_best_mask(rgb: np.ndarray, masks: List[Dict]) -> Optional[np.ndarray]:
-    """
-    Select a mask from SAM's automatic mask generator output.
-    We combine:
-      - larger area (prefer canopy-ish regions)
-      - green_score (prefer vegetation)
-      - penalize extremely huge masks (like entire image)
-    """
-    H, W, _ = rgb.shape
-    best = None
-    best_score = -1e9
-
-    for m in masks:
-        seg = m.get("segmentation", None)
-        if seg is None:
-            continue
-        seg = seg.astype(bool)
-        area = float(seg.sum()) / float(H * W)
-        if area < 0.01:  # ignore tiny segments
-            continue
-        gscore = compute_green_score(rgb, seg)
-
-        # scoring: encourage area, encourage green, penalize near-full-frame
-        penalty = 0.0
-        if area > 0.80:
-            penalty = 2.0 * (area - 0.80)  # strong penalty for "mask is basically everything"
-
-        score = (2.0 * gscore) + (1.0 * math.sqrt(area)) - penalty
-
-        if score > best_score:
-            best_score = score
-            best = seg
-
-    return best
-
-def apply_mask_crop(img: Image.Image, mask: np.ndarray, pad: int = 10) -> Image.Image:
-    """Crop to mask bounding box and black out background."""
-    rgb = image_to_np_rgb(img)
-    H, W, _ = rgb.shape
-
-    ys, xs = np.where(mask)
-    if len(xs) == 0:
-        return img
-
-    x0, x1 = max(0, xs.min() - pad), min(W - 1, xs.max() + pad)
-    y0, y1 = max(0, ys.min() - pad), min(H - 1, ys.max() + pad)
-
-    crop = rgb[y0:y1+1, x0:x1+1].copy()
-    crop_mask = mask[y0:y1+1, x0:x1+1]
-
-    # black background where not mask
-    crop[~crop_mask] = 0
-    return Image.fromarray(crop)
+def probs_to_percent(items: List[Dict[str, Any]], key="p") -> List[Dict[str, Any]]:
+    s = sum(float(x[key]) for x in items) + 1e-12
+    out = []
+    for x in items:
+        y = dict(x)
+        y["percent"] = float(x[key]) / s * 100.0
+        out.append(y)
+    return out
 
 
-# ----------------------------
-# Scorecard (indicative + tiered uncertainty)
-# ----------------------------
-
-def build_scorecard(mask_area_frac: float, leaf_type: str, phenology: str, tier: str) -> Dict:
-    """
-    Very rough proxy scorecard based on canopy fraction in the photo.
-    This is NOT a physical canopy area unless you have scale / geo.
-    Still useful as: relative ranking + transparency.
-
-    Outputs:
-      - CO2 sequestration range (relative)
-      - runoff interception range (relative)
-    """
-    # Base multipliers by category (toy assumptions)
-    leaf_mult = 1.00 if leaf_type == "broadleaf" else 0.85
-    phen_mult = 1.05 if phenology == "evergreen" else 1.00
-
-    # Convert mask fraction into a "size index" in [0,1] with mild nonlinearity
-    size_index = float(np.clip(mask_area_frac, 0.0, 1.0)) ** 0.6
-
-    # Toy baseline outputs in arbitrary units, then convert to indicative ranges.
-    # You should replace these with your chosen ecological model once you have real features (DBH, crown width, rainfall).
-    co2_base = 20.0  # "kg CO2/year" baseline for mid-size; purely illustrative
-    runoff_base = 200.0  # "L per rainfall event" baseline; purely illustrative
-
-    point_co2 = co2_base * size_index * leaf_mult * phen_mult
-    point_runoff = runoff_base * size_index * leaf_mult * phen_mult
-
-    # Uncertainty bands by tier
-    if tier == "high":
-        band = 0.30
-    elif tier == "medium":
-        band = 0.60
-    else:
-        band = 1.00
-
-    co2_range = [max(0.0, point_co2 * (1 - band)), point_co2 * (1 + band)]
-    runoff_range = [max(0.0, point_runoff * (1 - band)), point_runoff * (1 + band)]
-
-    return {
-        "tier": tier,
-        "inputs": {
-            "mask_area_fraction": mask_area_frac,
-            "leaf_type": leaf_type,
-            "phenology": phenology,
-            "notes": [
-                "These metrics are indicative and based on a photo-derived size proxy, not measured canopy area.",
-                "Replace toy constants with ecological models once you have real features (e.g., DBH, crown width, rainfall).",
-            ],
-        },
-        "outputs": {
-            "co2_sequestration_kg_per_year_range": [round(co2_range[0], 2), round(co2_range[1], 2)],
-            "runoff_interception_l_per_event_range": [round(runoff_range[0], 2), round(runoff_range[1], 2)],
-        },
-    }
-
-
-def infer_confidence_tier(mask_area_frac: float, used_sam: bool, view_type: str) -> str:
-    """
-    Simple heuristic:
-    - bark-only views are hard for species; canopy/whole tree is better
-    - if SAM wasn't used, confidence lower
-    """
-    if not used_sam:
-        return "low"
-    if mask_area_frac < 0.05:
-        return "low"
-    if view_type in ("a photo of a tree canopy with leaves", "a photo of a whole tree"):
-        return "medium"
-    return "low"
-
-
-# ----------------------------
-# Main
-# ----------------------------
-
-def load_sam(sam_checkpoint: Optional[str], device: str):
-    """
-    Loads Segment Anything if available.
-    Returns (sam_available, mask_generator)
-    """
-    if sam_checkpoint is None:
-        return False, None
-
-    try:
-        from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
-    except ImportError:
-        print("[WARN] segment-anything not installed. Falling back to no-segmentation mode.")
-        return False, None
-
-    if not os.path.exists(sam_checkpoint):
-        print(f"[WARN] SAM checkpoint not found: {sam_checkpoint}. Falling back to no-segmentation mode.")
-        return False, None
-
-    # You can change vit_h -> vit_l / vit_b depending on checkpoint
-    sam = sam_model_registry["vit_h"](checkpoint=sam_checkpoint)
-    sam.to(device=device)
-
-    mask_generator = SamAutomaticMaskGenerator(
-        sam,
-        points_per_side=24,
-        pred_iou_thresh=0.88,
-        stability_score_thresh=0.92,
-        crop_n_layers=1,
-        crop_n_points_downscale_factor=2,
-        min_mask_region_area=800,
-    )
-    return True, mask_generator
-
-
-def iter_images(image_dir: Path) -> List[Path]:
-    exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
-    files = [p for p in image_dir.rglob("*") if p.suffix.lower() in exts]
-    files.sort()
-    return files
-
-
+# -----------------------------
+# Main pipeline
+# -----------------------------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--image_dir", required=True, type=str, help="Folder containing tree images")
-    ap.add_argument("--out_dir", required=True, type=str, help="Output folder")
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", type=str)
-    ap.add_argument("--sam_checkpoint", default=None, type=str, help="Path to SAM checkpoint .pth")
-    ap.add_argument("--species_topk", default=5, type=int)
-    ap.add_argument("--species_list", default=None, type=str, help="Optional path to txt file, one species per line")
-    args = ap.parse_args()
+    # ---- Terminal prompts ----
+    images_dir = Path(ask("Input images folder:", "/home/fss6k/embedded_data_CM/query_maps/save_images_trees_in_the_streets_testing_query"))
+    out_dir = Path(ask("Output folder:", "/home/fss6k/tree_pipeline_outputs"))
+    ensure_dir(out_dir)
 
-    image_dir = Path(args.image_dir)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "json").mkdir(parents=True, exist_ok=True)
+    words_raw = ask("GroundingDINO prompt words (comma-separated):", "tree, tree trunk")
+    prompt_words = [w.strip() for w in words_raw.split(",") if w.strip()]
+    if not prompt_words:
+        print("ERROR: no prompt words provided.")
+        sys.exit(1)
 
-    # Load CLIP
-    device = args.device
-    clip_name = "openai/clip-vit-base-patch32"
-    processor = CLIPProcessor.from_pretrained(clip_name)
-    model = CLIPModel.from_pretrained(clip_name).to(device)
-    model.eval()
+    exts_raw = ask("Image extensions (comma-separated):", ".jpg,.jpeg,.png")
+    exts = tuple(e.strip() for e in exts_raw.split(",") if e.strip())
 
-    # Species list
-    species_candidates = DEFAULT_SPECIES_CANDIDATES
-    if args.species_list:
-        sp_path = Path(args.species_list)
-        if sp_path.exists():
-            if sp_path.suffix.lower() == ".json":
-                with open(sp_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                species_candidates = []
-                for tree in data.get("trees", []):
-                    for sp in tree.get("species", []):
-                        species_candidates.append(sp["name"])
-            else:
-                species_candidates = [ln.strip() for ln in sp_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    dino_box_thresh = float(ask("GroundingDINO box threshold:", "0.35"))
+    dino_text_thresh = float(ask("GroundingDINO text threshold:", "0.25"))
+    select_score_min = float(ask("Min score for selection heuristic:", "0.25"))
 
-    # Load SAM (optional)
-    sam_available, mask_generator = load_sam(args.sam_checkpoint, device=device)
+    sam_pad = int(ask("SAM box padding (pixels):", "50"))
+    sam_ckpt = ask("SAM checkpoint path:", "/home/fss6k/models/sam_vit_b_01ec64.pth")
+    sam_type = ask("SAM model type (vit_b/vit_l/vit_h):", "vit_b")
 
-    rows: List[TreeResult] = []
+    dino_model_path = ask("GroundingDINO local model path:", "/home/fss6k/models/grounding_dino_tiny")
 
-    files = iter_images(image_dir)
-    print(f"[INFO] Found {len(files)} images in {image_dir}")
+    bioclip_weights_path = ask("BioCLIP weights (.bin) path:", "/home/fss6k/models/bioclip_v1/open_clip_pytorch_model.bin")
+    bioclip_tokenizer_path = ask("BioCLIP tokenizer folder path:", "/home/fss6k/models/bioclip_v1")
+    tree_species_json = ask("Glasgow tree_species.json path:", "/home/fss6k/GALLANT-WS3/projects/Ask_the_map/tree_species.json")
 
-    for idx, fp in enumerate(files):
+    topk = int(ask("Top-K species to save:", "10"))
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"\nUsing device: {device}")
+
+    # ---- Load models once ----
+    print("\nLoading GroundingDINO...")
+    processor = AutoProcessor.from_pretrained(dino_model_path, local_files_only=True)
+    dino = AutoModelForZeroShotObjectDetection.from_pretrained(dino_model_path, local_files_only=True).to(device).eval()
+
+    print("Loading SAM...")
+    sam = sam_model_registry[sam_type](checkpoint=sam_ckpt)
+    sam.to(device).eval()
+    predictor = SamPredictor(sam)
+
+    print("Loading BioCLIP (open_clip)...")
+    # NOTE: if ViT-B-16 mismatches your weights, switch to ViT-B-32 here.
+    clip_model, _, preprocess = open_clip.create_model_and_transforms(
+        "ViT-B-16",
+        pretrained=bioclip_weights_path
+    )
+    clip_model = clip_model.to(device).eval()
+    tokenizer = HFTokenizer(bioclip_tokenizer_path)
+
+    print("Loading candidate species list...")
+    with open(tree_species_json, "r") as f:
+        tree_data = json.load(f)
+    candidates = flatten_glasgow_tree_list(tree_data)
+
+    # ---- Enumerate images ----
+    img_files = list_images(images_dir, exts)
+    print(f"\nFound {len(img_files)} images in {images_dir}")
+    if not img_files:
+        sys.exit(0)
+
+    # ---- Process ----
+    for img_path in img_files:
+        stem = img_path.stem
+        out_plot = out_dir / f"{stem}_panel.png"
+        out_json = out_dir / f"{stem}_results.json"
+
         try:
-            img = Image.open(fp).convert("RGB")
+            pil = Image.open(img_path).convert("RGB")
         except Exception as e:
-            print(f"[WARN] Could not open {fp}: {e}")
+            print(f"[SKIP] {img_path.name}: failed to open ({e})")
             continue
 
-        used_sam = False
-        mask_area_frac = 1.0
-        mask_green_score = 0.0
-        masked_img = img
+        W, H = pil.size
 
-        rgb = image_to_np_rgb(img)
+        # -------- GroundingDINO detect --------
+        text_labels = [prompt_words]  # DINO expects list-of-lists per image
 
-        # Segment with SAM if available
-        if sam_available and mask_generator is not None:
-            try:
-                masks = mask_generator.generate(rgb)
-                best_mask = pick_best_mask(rgb, masks)
-                if best_mask is not None:
-                    used_sam = True
-                    mask_area_frac = float(best_mask.mean())
-                    mask_green_score = compute_green_score(rgb, best_mask)
-                    masked_img = apply_mask_crop(img, best_mask, pad=12)
-            except Exception as e:
-                print(f"[WARN] SAM failed on {fp.name}: {e}")
+        inputs = processor(images=pil, text=text_labels, return_tensors="pt").to(device)
+        with torch.no_grad():
+            outputs = dino(**inputs)
 
-        # Functional classification
-        leaf_prompts = FUNCTIONAL_PROMPTS["leaf_type"]
-        leaf_probs, leaf_best = clip_zero_shot(model, processor, masked_img, leaf_prompts, device)
-        leaf_label = "broadleaf" if leaf_best == 0 else "conifer"
-
-        phen_prompts = FUNCTIONAL_PROMPTS["phenology"]
-        phen_probs, phen_best = clip_zero_shot(model, processor, masked_img, phen_prompts, device)
-        phen_label = "evergreen" if phen_best == 0 else "deciduous"
-
-        view_prompts = FUNCTIONAL_PROMPTS["scene_view"]
-        view_probs, view_best = clip_zero_shot(model, processor, masked_img, view_prompts, device)
-        view_label = view_prompts[view_best]
-
-        # Species suggestions (assistive)
-        # Use "a photo of <species>" prompts
-        sp_prompts = [f"a photo of {s}" for s in species_candidates]
-        sp_probs, sp_best = clip_zero_shot(model, processor, masked_img, sp_prompts, device)
-        topk = int(np.clip(args.species_topk, 1, len(species_candidates)))
-        top_idx = np.argsort(sp_probs)[::-1][:topk].tolist()
-        top_species_list = [{"species": species_candidates[i], "p": float(sp_probs[i])} for i in top_idx]
-
-        confidence_tier = infer_confidence_tier(mask_area_frac, used_sam, view_label)
-        scorecard = build_scorecard(mask_area_frac, leaf_label, phen_label, confidence_tier)
-
-        result = TreeResult(
-            image_name=fp.name,
-            used_sam=used_sam,
-            mask_area_frac=mask_area_frac,
-            mask_green_score=mask_green_score,
-            functional_leaf_type=leaf_label,
-            functional_leaf_type_p=float(leaf_probs[leaf_best]),
-            functional_phenology=phen_label,
-            functional_phenology_p=float(phen_probs[phen_best]),
-            view_type=view_label,
-            view_type_p=float(view_probs[view_best]),
-            top_species=species_candidates[sp_best],
-            top_species_p=float(sp_probs[sp_best]),
-            top_species_list_json=json.dumps(top_species_list, ensure_ascii=False),
-            confidence_tier=confidence_tier,
-            scorecard_json=json.dumps(scorecard, ensure_ascii=False),
+        results = processor.post_process_grounded_object_detection(
+            outputs,
+            inputs.input_ids,
+            threshold=dino_box_thresh,
+            text_threshold=dino_text_thresh,
+            target_sizes=[(H, W)]
         )
-        rows.append(result)
+        detections = results[0]
 
-        # Per-image JSON
-        out_json = out_dir / "json" / f"{fp.stem}.json"
-        with open(out_json, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "image": fp.name,
-                    "segmentation": {
-                        "used_sam": used_sam,
-                        "mask_area_fraction": mask_area_frac,
-                        "mask_green_score": mask_green_score,
-                    },
-                    "functional": {
-                        "leaf_type": {"label": leaf_label, "p": leaf_probs[leaf_best], "all": dict(zip(leaf_prompts, leaf_probs))},
-                        "phenology": {"label": phen_label, "p": phen_probs[phen_best], "all": dict(zip(phen_prompts, phen_probs))},
-                        "view": {"label": view_label, "p": view_probs[view_best], "all": dict(zip(view_prompts, view_probs))},
-                    },
-                    "species_suggestions": top_species_list,
-                    "confidence_tier": confidence_tier,
-                    "scorecard": scorecard,
+        best_box = select_tree_box(detections, pil.size, score_min=select_score_min)
+
+        # If no box, still save a debug plot + JSON
+        if best_box is None:
+            fig, axes = plt.subplots(1, 3, figsize=(15, 6))
+            axes[0].imshow(pil); axes[0].set_title("RAW"); axes[0].axis("off")
+            axes[1].imshow(pil); axes[1].set_title("NO BOX SELECTED"); axes[1].axis("off")
+            axes[2].imshow(np.zeros((H, W, 3), dtype=np.uint8)); axes[2].set_title("MASKED (N/A)"); axes[2].axis("off")
+            plt.tight_layout()
+            fig.savefig(out_plot, dpi=160)
+            plt.close(fig)
+
+            payload = {
+                "image": str(img_path),
+                "status": "no_detection",
+                "prompt_words": prompt_words,
+                "dino": {
+                    "box_threshold": dino_box_thresh,
+                    "text_threshold": dino_text_thresh,
+                    "num_boxes": int(len(detections.get("boxes", []))),
                 },
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
+                "selected_box": None,
+                "sam": None,
+                "bioclip": None,
+            }
+            with open(out_json, "w") as f:
+                json.dump(payload, f, indent=2)
+            print(f"[NO DETECTION] {img_path.name} -> saved {out_plot.name}, {out_json.name}")
+            continue
 
-        if (idx + 1) % 10 == 0:
-            print(f"[INFO] Processed {idx+1}/{len(files)}")
+        # -------- SAM mask --------
+        np_img = np.array(pil, dtype=np.uint8)
+        predictor.set_image(np_img)
 
-    # Write CSV summary
-    out_csv = out_dir / "results.csv"
-    with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(asdict(rows[0]).keys()) if rows else [])
-        if rows:
-            writer.writeheader()
-            for r in rows:
-                writer.writerow(asdict(r))
+        box_used = expand_box(best_box, np_img.shape, pad=sam_pad)
+        box_np = np.array(box_used, dtype=np.float32)
 
-    print(f"[DONE] Wrote {len(rows)} results to {out_csv} and JSONs to {out_dir / 'json'}")
+        masks, scores, _ = predictor.predict(box=box_np, multimask_output=True)
+        best_idx = int(np.argmax(scores))
+        mask = masks[best_idx].astype(bool)
+        sam_score = float(scores[best_idx])
+
+        masked = np_img.copy()
+        masked[~mask] = 0
+
+        # -------- BioCLIP classify (masked image) --------
+        masked_pil = Image.fromarray(masked)
+
+        top_species, top_genera = bioclip_rank_species(
+            masked_pil,
+            candidates=candidates,
+            model=clip_model,
+            preprocess=preprocess,
+            tokenizer=tokenizer,
+            device=device,
+            topk=topk
+        )
+
+        # Convert to percentages for JSON readability
+        top_species_pct = probs_to_percent(top_species, key="p")
+        top_genera_pct = []
+        genus_sum = sum(g[1] for g in top_genera) + 1e-12
+        for g, p in top_genera[:min(10, len(top_genera))]:
+            top_genera_pct.append({"genus": g, "percent": float(p) / genus_sum * 100.0, "p": float(p)})
+
+        # -------- Save 3-panel plot --------
+        fig, axes = plt.subplots(1, 3, figsize=(15, 6))
+
+        axes[0].imshow(pil)
+        axes[0].set_title("RAW")
+        axes[0].axis("off")
+
+        axes[1].imshow(pil)
+        axes[1].set_title("SELECTED BOX")
+        axes[1].axis("off")
+        draw_selected_box(axes[1], best_box, label="SELECTED")
+
+        axes[2].imshow(masked)
+        axes[2].set_title("MASKED (SAM)")
+        axes[2].axis("off")
+
+        plt.tight_layout()
+        fig.savefig(out_plot, dpi=160)
+        plt.close(fig)
+
+        # -------- Save JSON --------
+        payload = {
+            "image": str(img_path),
+            "status": "ok",
+            "prompt_words": prompt_words,
+
+            "dino": {
+                "model_path": dino_model_path,
+                "box_threshold": dino_box_thresh,
+                "text_threshold": dino_text_thresh,
+                "num_boxes": int(len(detections.get("boxes", []))),
+                # store raw boxes/scores for debugging
+                "boxes": [list(map(float, b.tolist())) for b in detections.get("boxes", [])],
+                "scores": [float(s) for s in detections.get("scores", [])],
+            },
+
+            "selected_box": {
+                "box_xyxy": best_box,
+                "box_used_for_sam_xyxy": box_used,
+            },
+
+            "sam": {
+                "model_type": sam_type,
+                "checkpoint": sam_ckpt,
+                "pad": sam_pad,
+                "best_score": sam_score,
+            },
+
+            "bioclip": {
+                "weights": bioclip_weights_path,
+                "tokenizer_path": bioclip_tokenizer_path,
+                "top_species": top_species_pct,   # has "percent"
+                "top_genera": top_genera_pct,     # has "percent"
+            },
+
+            "outputs": {
+                "panel_plot": str(out_plot),
+                "json": str(out_json),
+            }
+        }
+
+        with open(out_json, "w") as f:
+            json.dump(payload, f, indent=2)
+
+        best_name = top_species_pct[0]["species"] if top_species_pct else "UNKNOWN"
+        best_pct = top_species_pct[0]["percent"] if top_species_pct else 0.0
+        print(f"[OK] {img_path.name} -> {out_plot.name}, {out_json.name} | top: {best_name} ({best_pct:.1f}%)")
 
 
 if __name__ == "__main__":
