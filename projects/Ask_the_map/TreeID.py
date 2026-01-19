@@ -55,7 +55,6 @@ def clamp_box(box, W, H):
 
 # -----------------------------
 # GroundingDINO selection logic
-# (your heuristic, wrapped)
 # -----------------------------
 def select_tree_box(
     detections: Dict[str, Any],
@@ -127,7 +126,7 @@ def expand_box(box: List[int], image_shape, pad: int = 50) -> List[int]:
 
 
 # -----------------------------
-# BioCLIP helpers (your logic)
+# BioCLIP helpers
 # -----------------------------
 def clean_species_name(name: str) -> str:
     name2 = re.sub(r"\s*'[^']+'", "", name)
@@ -215,6 +214,61 @@ def probs_to_percent(items: List[Dict[str, Any]], key="p") -> List[Dict[str, Any
 
 
 # -----------------------------
+# NEW: Save pie/donut chart helper
+# -----------------------------
+def save_species_pie_chart(
+    species: List[Dict[str, Any]],
+    out_path: Path,
+    entry_id: str,
+    top_k: int = 5
+) -> Optional[Path]:
+    """
+    Save a donut chart of species probabilities.
+    species: list of dicts with keys ["species", "percent"]
+    """
+    if not species:
+        return None
+
+    top = species[:top_k]
+    other_pct = sum(s["percent"] for s in species[top_k:])
+
+    sizes = [s["percent"] for s in top] + [other_pct]
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    wedges, _ = ax.pie(
+        sizes,
+        startangle=140,
+        wedgeprops=dict(
+            width=0.5,
+            edgecolor="black",
+            linewidth=1.2
+        ),
+    )
+
+    legend_labels = (
+        [f"{s['species']} — {s['percent']:.1f}%" for s in top]
+        + [f"Other — {other_pct:.1f}%"]
+    )
+
+    ax.legend(
+        wedges,
+        legend_labels,
+        loc="center left",
+        bbox_to_anchor=(1.0, 0.5),
+        frameon=False,
+    )
+
+    ax.set_aspect("equal")
+
+    plt.tight_layout()
+
+    out_file = out_path / f"pie_chart_{entry_id}.png"
+    fig.savefig(out_file, dpi=160)
+    plt.close(fig)
+    return out_file
+
+
+# -----------------------------
 # Main pipeline
 # -----------------------------
 def main():
@@ -262,7 +316,6 @@ def main():
     predictor = SamPredictor(sam)
 
     print("Loading BioCLIP (open_clip)...")
-    # NOTE: if ViT-B-16 mismatches your weights, switch to ViT-B-32 here.
     clip_model, _, preprocess = open_clip.create_model_and_transforms(
         "ViT-B-16",
         pretrained=bioclip_weights_path
@@ -286,6 +339,7 @@ def main():
         stem = img_path.stem
         out_plot = out_dir / f"{stem}_panel.png"
         out_json = out_dir / f"{stem}_results.json"
+        out_pie = None  # will be created later
 
         try:
             pil = Image.open(img_path).convert("RGB")
@@ -296,7 +350,7 @@ def main():
         W, H = pil.size
 
         # -------- GroundingDINO detect --------
-        text_labels = [prompt_words]  # DINO expects list-of-lists per image
+        text_labels = [prompt_words]
 
         inputs = processor(images=pil, text=text_labels, return_tensors="pt").to(device)
         with torch.no_grad():
@@ -335,6 +389,11 @@ def main():
                 "selected_box": None,
                 "sam": None,
                 "bioclip": None,
+                "outputs": {
+                    "panel_plot": str(out_plot),
+                    "pie_chart": None,
+                    "json": str(out_json),
+                }
             }
             with open(out_json, "w") as f:
                 json.dump(payload, f, indent=2)
@@ -376,6 +435,14 @@ def main():
         for g, p in top_genera[:min(10, len(top_genera))]:
             top_genera_pct.append({"genus": g, "percent": float(p) / genus_sum * 100.0, "p": float(p)})
 
+        # -------- NEW: Save pie/donut chart --------
+        out_pie = save_species_pie_chart(
+            species=top_species_pct,
+            out_path=out_dir,
+            entry_id=stem,
+            top_k=5
+        )
+
         # -------- Save 3-panel plot --------
         fig, axes = plt.subplots(1, 3, figsize=(15, 6))
 
@@ -407,7 +474,6 @@ def main():
                 "box_threshold": dino_box_thresh,
                 "text_threshold": dino_text_thresh,
                 "num_boxes": int(len(detections.get("boxes", []))),
-                # store raw boxes/scores for debugging
                 "boxes": [list(map(float, b.tolist())) for b in detections.get("boxes", [])],
                 "scores": [float(s) for s in detections.get("scores", [])],
             },
@@ -427,12 +493,13 @@ def main():
             "bioclip": {
                 "weights": bioclip_weights_path,
                 "tokenizer_path": bioclip_tokenizer_path,
-                "top_species": top_species_pct,   # has "percent"
-                "top_genera": top_genera_pct,     # has "percent"
+                "top_species": top_species_pct,
+                "top_genera": top_genera_pct,
             },
 
             "outputs": {
                 "panel_plot": str(out_plot),
+                "pie_chart": str(out_pie) if out_pie else None,
                 "json": str(out_json),
             }
         }
@@ -442,7 +509,7 @@ def main():
 
         best_name = top_species_pct[0]["species"] if top_species_pct else "UNKNOWN"
         best_pct = top_species_pct[0]["percent"] if top_species_pct else 0.0
-        print(f"[OK] {img_path.name} -> {out_plot.name}, {out_json.name} | top: {best_name} ({best_pct:.1f}%)")
+        print(f"[OK] {img_path.name} -> {out_plot.name}, {out_json.name}, {Path(out_pie).name if out_pie else 'no_pie'} | top: {best_name} ({best_pct:.1f}%)")
 
 
 if __name__ == "__main__":
