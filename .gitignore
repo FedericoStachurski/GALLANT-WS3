@@ -8,11 +8,11 @@ notebooks/
 projects/Flickr_proj/models/
 *__pycache__*/
 /projects/utilities_scr/__pycache__/
-
+notebooks/*.ipynb
 temp_scr_communimap/
 notebooks/images_GIS_hub/
 *ipynb
-
+**/.ipynb_checkpoints/
 # Ignore environment files
 # /environment.yml
 /conda-env.yml
