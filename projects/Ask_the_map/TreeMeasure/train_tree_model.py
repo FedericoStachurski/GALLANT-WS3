@@ -1,42 +1,10 @@
 #!/usr/bin/env python3
-"""
-train_tree_size_boxed_flex.py
-
-Multitask training (HEIGHT_Y, TRUNK_Y) using:
-- RGB (jpg)
-- Depth (.npy)
-- BOX_JSON (GroundingDINO) to crop RGB+Depth
-
-Configurable:
-- train/val split (val_frac)
-- backbone depth: resnet18/resnet34/resnet50
-- head MLP size/layers, optional BatchNorm, dropout
-- freeze backbone
-
-Saves to --out_dir:
-- best.pt, last.pt
-- metrics.csv, metrics.json
-- summary.json
-
-Example:
-python train_tree_size_boxed_flex.py \
-  --manifest /home/fss6k/embedded_data_CM/tree_manifest_jan26.csv \
-  --out_dir /home/fss6k/models/tree_size_runs/jan26_flex_run1 \
-  --backbone resnet18 \
-  --head_dims 512 256 \
-  --head_bn \
-  --dropout 0.2 \
-  --val_frac 0.2 \
-  --epochs 20 --batch_size 16 --lr 3e-4 --weight_decay 1e-4 --img_size 384
-"""
-
 from __future__ import annotations
 
 import argparse
-import csv
 import json
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -44,482 +12,487 @@ from PIL import Image
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
 
-
-# -------------------------
-# Box + Depth utils
-# -------------------------
-def load_box_xyxy(box_json_path: str) -> Optional[Tuple[int, int, int, int]]:
-    try:
-        with open(box_json_path, "r") as f:
-            j = json.load(f)
-        box = j.get("box_xyxy_padded") or j.get("box_xyxy")
-        if box is None or len(box) != 4:
-            return None
-        x1, y1, x2, y2 = box
-        return int(x1), int(y1), int(x2), int(y2)
-    except Exception:
-        return None
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import f1_score, recall_score
 
 
-def clamp_box(x1, y1, x2, y2, W, H) -> Tuple[int, int, int, int]:
-    x1 = max(0, min(int(x1), W - 1))
-    y1 = max(0, min(int(y1), H - 1))
-    x2 = max(1, min(int(x2), W))
-    y2 = max(1, min(int(y2), H))
-    if x2 <= x1:
-        x2 = min(W, x1 + 1)
-    if y2 <= y1:
-        y2 = min(H, y1 + 1)
-    return x1, y1, x2, y2
+# =========================================================
+# Dataset
+# =========================================================
+import random
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from PIL import Image
+from torchvision import transforms
 
 
-def depth_to_uint8(depth: np.ndarray) -> np.ndarray:
-    d = depth.astype(np.float32)
-    lo, hi = np.percentile(d, [2, 98])
-    if hi - lo < 1e-6:
-        dn = np.zeros_like(d, dtype=np.float32)
-    else:
-        dn = np.clip((d - lo) / (hi - lo), 0.0, 1.0)
-    return (dn * 255.0).astype(np.uint8)
-
-
-# -------------------------
-# Dataset: crop by box, stack RGB+Depth
-# -------------------------
-class TreeSizeBoxedDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, img_size: int, augment: bool):
+class TreeHeightDataset(Dataset):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        image_size: int = 224,
+        use_depth: bool = True,
+        train: bool = True,
+    ):
         self.df = df.reset_index(drop=True)
-        self.img_size = img_size
+        self.use_depth = use_depth
+        self.image_size = image_size
+        self.train = train
 
-        if augment:
-            # augment only on TRAIN split
-            self.tf_rgb = transforms.Compose(
-                [
-                    transforms.RandomResizedCrop(img_size, scale=(0.80, 1.00)),
-                    transforms.RandomHorizontalFlip(p=0.5),
-                    transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.02),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225]),
-                ]
+        # -------------------------
+        # RGB transforms
+        # -------------------------
+        if self.train:
+            self.rgb_tfms = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(8),
+                transforms.ColorJitter(
+                    brightness=0.15,
+                    contrast=0.15,
+                    saturation=0.10,
+                    hue=0.02,
+                ),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ])
+
+            # Apply after normalization, RGB only
+            self.rgb_erasing = transforms.RandomErasing(
+                p=0.20,
+                scale=(0.02, 0.10),
+                ratio=(0.3, 3.3),
+                value="random",
             )
         else:
-            self.tf_rgb = transforms.Compose(
-                [
-                    transforms.Resize((img_size, img_size)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225]),
-                ]
-            )
+            self.rgb_tfms = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ])
+            self.rgb_erasing = None
 
-        self.tf_depth = transforms.Compose(
-            [
-                transforms.Resize((img_size, img_size)),
-                transforms.ToTensor(),  # (1,H,W) from uint8
-            ]
-        )
+        # -------------------------
+        # Depth transforms
+        # -------------------------
+        self.depth_resize = transforms.Resize((image_size, image_size))
+        self.depth_to_tensor = transforms.ToTensor()
 
     def __len__(self):
         return len(self.df)
 
-    def __getitem__(self, idx: int):
-        r = self.df.iloc[idx]
-        img_path = str(r["IMAGE_PATH"])
-        depth_path = str(r["DEPTH_PATH"])
-        box_json = str(r["BOX_JSON"])
+    def _load_depth_tensor(self, depth_path: str, dtype: torch.dtype) -> torch.Tensor:
+        try:
+            depth = np.load(depth_path).astype(np.float32)
 
-        rgb = Image.open(img_path).convert("RGB")
-        W, H = rgb.size
+            # guard against bad arrays
+            if depth.ndim != 2:
+                raise ValueError(f"Depth array must be 2D, got shape {depth.shape}")
 
-        box = load_box_xyxy(box_json)
-        if box is None:
-            x1, y1, x2, y2 = 0, 0, W, H
+            dmin, dmax = depth.min(), depth.max()
+            depth = (depth - dmin) / (dmax - dmin + 1e-8)
+
+            depth_img = Image.fromarray((depth * 255).astype(np.uint8)).convert("L")
+            depth_img = self.depth_resize(depth_img)
+            depth_tensor = self.depth_to_tensor(depth_img).to(dtype=dtype)  # (1,H,W)
+
+        except Exception:
+            depth_tensor = torch.zeros(1, self.image_size, self.image_size, dtype=dtype)
+
+        return depth_tensor
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # -------------------------
+        # RGB
+        # -------------------------
+        rgb = Image.open(row["RGB_CROP_PATH"]).convert("RGB")
+        rgb_tensor = self.rgb_tfms(rgb)  # (3,H,W)
+
+        if self.train and self.rgb_erasing is not None:
+            rgb_tensor = self.rgb_erasing(rgb_tensor)
+
+        # -------------------------
+        # Depth
+        # -------------------------
+        if self.use_depth:
+            depth_tensor = self._load_depth_tensor(
+                row["DEPTH_PATH"],
+                dtype=rgb_tensor.dtype
+            )
+            x = torch.cat([rgb_tensor, depth_tensor], dim=0)  # (4,H,W)
         else:
-            x1, y1, x2, y2 = clamp_box(*box, W=W, H=H)
+            x = rgb_tensor  # (3,H,W)
 
-        rgb_crop = rgb.crop((x1, y1, x2, y2))
-        rgb_t = self.tf_rgb(rgb_crop)  # (3,S,S)
-
-        d = np.load(depth_path).astype(np.float32)
-        d = np.squeeze(d)
-        if d.ndim != 2:
-            raise ValueError(f"Depth array has unexpected shape {d.shape} for {depth_path}")
-
-        Hd, Wd = d.shape
-        x1d, y1d, x2d, y2d = clamp_box(x1, y1, x2, y2, W=Wd, H=Hd)
-        d_crop = d[y1d:y2d, x1d:x2d]
-        d_u8 = depth_to_uint8(d_crop)
-        d_img = Image.fromarray(d_u8)
-        d_t = self.tf_depth(d_img) / 255.0  # (1,S,S)
-
-        x = torch.cat([rgb_t, d_t], dim=0)  # (4,S,S)
-        y_h = int(r["HEIGHT_Y"])
-        y_t = int(r["TRUNK_Y"])
-        return x, torch.tensor(y_h, dtype=torch.long), torch.tensor(y_t, dtype=torch.long)
+        y = int(row["HEIGHT_CLASS_IDX"])
+        return x, y
 
 
-# -------------------------
-# Model builders
-# -------------------------
-def build_backbone(name: str, in_ch: int = 4, pretrained: bool = True) -> Tuple[nn.Module, int]:
-    if name == "resnet18":
-        net = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
-    elif name == "resnet34":
-        net = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1 if pretrained else None)
-    elif name == "resnet50":
-        net = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None)
-    else:
-        raise ValueError(f"Unsupported backbone: {name}")
+# =========================================================
+# Models
+# =========================================================
+def build_resnet(backbone: str, num_classes: int, in_channels: int, device, dropout_rate: float = 0.1) -> nn.Module:
+    backbone = backbone.lower()
 
-    # adapt first conv to 4ch
-    old = net.conv1
-    if in_ch != old.in_channels:
-        new = nn.Conv2d(in_ch, old.out_channels,
-                        kernel_size=old.kernel_size,
-                        stride=old.stride,
-                        padding=old.padding,
-                        bias=False)
-        with torch.no_grad():
-            new.weight[:, :3] = old.weight
-            # depth channel init = mean RGB filters
-            mean_w = old.weight.mean(dim=1, keepdim=True)
-            if in_ch > 3:
-                new.weight[:, 3:4] = mean_w
-        net.conv1 = new
-
-    feat_dim = net.fc.in_features
-    net.fc = nn.Identity()
-    return net, feat_dim
-
-
-def build_mlp_head(in_dim: int, out_dim: int, head_dims: List[int], dropout: float, use_bn: bool) -> nn.Module:
-    layers: List[nn.Module] = []
-    prev = in_dim
-    for h in head_dims:
-        layers.append(nn.Linear(prev, h))
-        if use_bn:
-            layers.append(nn.BatchNorm1d(h))
-        layers.append(nn.ReLU(inplace=True))
-        if dropout and dropout > 0:
-            layers.append(nn.Dropout(p=dropout))
-        prev = h
-    layers.append(nn.Linear(prev, out_dim))
-    return nn.Sequential(*layers)
-
-
-class MultiHeadModel(nn.Module):
-    def __init__(
-        self,
-        backbone_name: str,
-        head_dims: List[int],
-        dropout: float,
-        head_bn: bool,
-        pretrained: bool = True,
-        num_height: int = 4,
-        num_trunk: int = 4,
-    ):
-        super().__init__()
-        self.backbone, feat_dim = build_backbone(backbone_name, in_ch=4, pretrained=pretrained)
-        self.head_h = build_mlp_head(feat_dim, num_height, head_dims, dropout, head_bn)
-        self.head_t = build_mlp_head(feat_dim, num_trunk, head_dims, dropout, head_bn)
-
-    def forward(self, x):
-        f = self.backbone(x)
-        return self.head_h(f), self.head_t(f)
-
-
-# -------------------------
-# Metrics
-# -------------------------
-@torch.no_grad()
-def evaluate(model, loader, device):
-    model.eval()
-    loss_sum = 0.0
-    n = 0
-    h_correct = h_total = 0
-    t_correct = t_total = 0
-
-    for x, y_h, y_t in loader:
-        x, y_h, y_t = x.to(device), y_h.to(device), y_t.to(device)
-        logits_h, logits_t = model(x)
-
-        loss_h = F.cross_entropy(logits_h, y_h, ignore_index=-1)
-        loss_t = F.cross_entropy(logits_t, y_t, ignore_index=-1)
-        loss = loss_h + loss_t
-
-        loss_sum += float(loss.item()) * x.size(0)
-        n += x.size(0)
-
-        mask_h = (y_h != -1)
-        if mask_h.any():
-            pred_h = logits_h.argmax(1)
-            h_correct += int((pred_h[mask_h] == y_h[mask_h]).sum().item())
-            h_total += int(mask_h.sum().item())
-
-        mask_t = (y_t != -1)
-        if mask_t.any():
-            pred_t = logits_t.argmax(1)
-            t_correct += int((pred_t[mask_t] == y_t[mask_t]).sum().item())
-            t_total += int(mask_t.sum().item())
-
-    return {
-        "val_loss": loss_sum / max(1, n),
-        "height_acc": (h_correct / h_total) if h_total > 0 else None,
-        "trunk_acc": (t_correct / t_total) if t_total > 0 else None,
-        "height_n": int(h_total),
-        "trunk_n": int(t_total),
+    weights_map = {
+        "resnet18": models.ResNet18_Weights.DEFAULT,
+        "resnet34": models.ResNet34_Weights.DEFAULT,
+        "resnet50": models.ResNet50_Weights.DEFAULT,
+        "resnet101": models.ResNet101_Weights.DEFAULT,
     }
 
+    if backbone not in weights_map:
+        raise ValueError(f"Unsupported backbone: {backbone}")
 
-# -------------------------
+    model = getattr(models, backbone)(weights=weights_map[backbone])
+
+    if in_channels != 3:
+        old_conv = model.conv1
+        model.conv1 = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+            bias=False,
+        )
+        with torch.no_grad():
+            model.conv1.weight[:, :3] = old_conv.weight
+            if in_channels > 3:
+                for c in range(3, in_channels):
+                    model.conv1.weight[:, c:c+1] = old_conv.weight.mean(dim=1, keepdim=True)
+
+    model.fc = nn.Sequential(
+        nn.Dropout(p= dropout_rate),
+        nn.Linear(model.fc.in_features, num_classes)
+    )
+    return model.to(device)
+
+
+# =========================================================
+# Train / eval
+# =========================================================
+def run_epoch(model, loader, criterion, device, optimizer=None):
+    train_mode = optimizer is not None
+    model.train() if train_mode else model.eval()
+
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+    all_preds, all_labels = [], []
+
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        if train_mode:
+            optimizer.zero_grad()
+
+        with torch.set_grad_enabled(train_mode):
+            out = model(x)
+            loss = criterion(out, y)
+
+            if train_mode:
+                loss.backward()
+                optimizer.step()
+
+        preds = out.argmax(dim=1)
+
+        total_loss += loss.item() * x.size(0)
+        total_correct += (preds == y).sum().item()
+        total_samples += x.size(0)
+
+        all_preds.extend(preds.detach().cpu().numpy())
+        all_labels.extend(y.detach().cpu().numpy())
+
+    return (
+        total_loss / total_samples,
+        total_correct / total_samples,
+        np.array(all_preds),
+        np.array(all_labels),
+    )
+
+
+# =========================================================
+# Utilities
+# =========================================================
+def find_dataset_dir(out_root: Path, dataset_name: str | None, full_dataset_path: str | None) -> Path:
+    if full_dataset_path is not None:
+        p = Path(full_dataset_path)
+        if not p.exists():
+            raise FileNotFoundError(f"Dataset path not found: {p}")
+        return p
+
+    if dataset_name is None:
+        raise ValueError("Provide either --dataset_path or --dataset_name")
+
+    matches = sorted([p for p in out_root.glob(f"{dataset_name}_*") if p.is_dir()])
+    if not matches:
+        raise FileNotFoundError(f"No dataset folders found for pattern: {dataset_name}_* under {out_root}")
+
+    return matches[-1]  # newest lexicographically because timestamp suffix
+
+
+def load_manifest(dataset_dir: Path) -> pd.DataFrame:
+    manifest_path = dataset_dir / "manifests" / "tree_dataset_manifest.csv"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+
+    df = pd.read_csv(manifest_path)
+    needed = ["RGB_CROP_PATH", "HEIGHT_CLASS_STR", "HEIGHT_CLASS_IDX"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"Manifest missing required columns: {missing}")
+
+    df = df[df["RGB_CROP_PATH"].notna() & df["HEIGHT_CLASS_IDX"].notna()].copy()
+
+    # if depth is available it can be used later
+    if "DEPTH_PATH" not in df.columns:
+        df["DEPTH_PATH"] = np.nan
+
+    return df.reset_index(drop=True)
+
+
+# =========================================================
 # Main
-# -------------------------
+# =========================================================
 def main():
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--manifest", required=True, type=str)
-    ap.add_argument("--out_dir", required=True, type=str)
+    # dataset selection
+    ap.add_argument("--out_root", type=str, default="/home/fss6k/datasets")
+    ap.add_argument("--dataset_name", type=str, default=None,
+                    help="Base dataset name, e.g. communimap_trees. Script will load newest matching folder.")
+    ap.add_argument("--dataset_path", type=str, default=None,
+                    help="Full dataset folder path. Overrides --dataset_name.")
 
-    # Split control
-    ap.add_argument("--val_frac", type=float, default=0.2, help="Fraction of data used for validation (0-1).")
-    ap.add_argument("--seed", type=int, default=42)
+    # model / data options
+    ap.add_argument("--backbone", type=str, default="resnet50",
+                    choices=["resnet18", "resnet34", "resnet50", "resnet101"])
+    ap.add_argument("--use_depth", action="store_true")
+    ap.add_argument("--image_size", type=int, default=224)
 
-    # Model control
-    ap.add_argument("--backbone", type=str, default="resnet18", choices=["resnet18", "resnet34", "resnet50"])
-    ap.add_argument("--pretrained", action="store_true", help="Use ImageNet-pretrained backbone.")
-    ap.add_argument("--head_dims", type=int, nargs="*", default=[512], help="MLP hidden dims for each head.")
-    ap.add_argument("--head_bn", action="store_true", help="Use BatchNorm in head MLP.")
-    ap.add_argument("--dropout", type=float, default=0.0)
-
-    ap.add_argument("--freeze_backbone", action="store_true", help="Freeze backbone weights (train heads only).")
-
-    # Training hyperparams
-    ap.add_argument("--epochs", type=int, default=20)
+    # training hyperparameters
     ap.add_argument("--batch_size", type=int, default=16)
-    ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--weight_decay", type=float, default=1e-4)
-    ap.add_argument("--img_size", type=int, default=256)
+    ap.add_argument("--dropout_rate", type=float, default=0.1)
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--weight_decay", type=float, default=0.0)
+    ap.add_argument("--val_size", type=float, default=0.2)
+    ap.add_argument("--random_state", type=int, default=42)
     ap.add_argument("--num_workers", type=int, default=4)
-    ap.add_argument("--augment", action="store_true", help="Enable RGB augmentations on training set only.")
-
-    ap.add_argument("--w_height", type=float, default=1.0)
-    ap.add_argument("--w_trunk", type=float, default=0.5)
-
 
     args = ap.parse_args()
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Device:", device)
+    out_root = Path(args.out_root)
+    dataset_dir = find_dataset_dir(out_root, args.dataset_name, args.dataset_path)
+    df = load_manifest(dataset_dir)
 
-    # Output files
-    metrics_csv = out_dir / "metrics.csv"
-    metrics_json = out_dir / "metrics.json"
-    summary_json = out_dir / "summary.json"
-    best_ckpt_path = out_dir / "best.pt"
-    last_ckpt_path = out_dir / "last.pt"
+    if args.use_depth:
+        df = df[df["DEPTH_PATH"].notna()].copy()
 
-    # init CSV
-    with open(metrics_csv, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["epoch", "train_loss", "val_loss", "height_acc", "height_n", "trunk_acc", "trunk_n", "lr"])
+    df = df.drop_duplicates(subset=["RGB_CROP_PATH"]).reset_index(drop=True)
 
-    # Load manifest
-    mpath = Path(args.manifest)
-    df = pd.read_parquet(mpath) if mpath.suffix.lower() == ".parquet" else pd.read_csv(mpath)
+    print(f"Using dataset: {dataset_dir}")
+    print(f"Total rows: {len(df)}")
+    print(df["HEIGHT_CLASS_STR"].value_counts().sort_index())
 
-    required = ["IMAGE_PATH", "DEPTH_PATH", "BOX_JSON", "HEIGHT_Y", "TRUNK_Y"]
-    for c in required:
-        if c not in df.columns:
-            raise RuntimeError(f"Manifest missing required column: {c}")
-
-    df["HEIGHT_Y"] = df["HEIGHT_Y"].fillna(-1).astype(int)
-    df["TRUNK_Y"] = df["TRUNK_Y"].fillna(-1).astype(int)
-
-    # Must have files
-    df = df[df["IMAGE_PATH"].apply(lambda p: Path(str(p)).exists())].copy()
-    df = df[df["DEPTH_PATH"].apply(lambda p: Path(str(p)).exists())].copy()
-    df = df[df["BOX_JSON"].apply(lambda p: Path(str(p)).exists())].copy()
-
-    # Keep rows with at least one label
-    df = df[(df["HEIGHT_Y"] != -1) | (df["TRUNK_Y"] != -1)].reset_index(drop=True)
-
-    if len(df) == 0:
-        raise RuntimeError("No rows after filtering. Check manifest paths/boxes/labels.")
-
-    print("Rows:", len(df))
-    print("Height labeled:", int((df["HEIGHT_Y"] != -1).sum()))
-    print("Trunk labeled:", int((df["TRUNK_Y"] != -1).sum()))
-    print("val_frac:", args.val_frac)
-
-    # split
-    torch.manual_seed(args.seed)
-    n_val = max(1, int(len(df) * args.val_frac))
-    n_train = len(df) - n_val
-    if n_train <= 0:
-        raise RuntimeError("val_frac too large: no training samples left.")
-
-    # build datasets with different augmentation settings
-    full_ds_train = TreeSizeBoxedDataset(df, img_size=args.img_size, augment=args.augment)
-    full_ds_val = TreeSizeBoxedDataset(df, img_size=args.img_size, augment=False)
-
-    # same indices split for both
-    train_ds, val_ds = random_split(
-        range(len(df)),
-        [n_train, n_val],
-        generator=torch.Generator().manual_seed(args.seed),
+    train_df, val_df = train_test_split(
+        df,
+        test_size=args.val_size,
+        random_state=args.random_state,
+        stratify=df["HEIGHT_CLASS_IDX"],
     )
 
-    # wrap subsets
-    train_idx = list(train_ds)
-    val_idx = list(val_ds)
-    train_df = df.iloc[train_idx].reset_index(drop=True)
-    val_df = df.iloc[val_idx].reset_index(drop=True)
+    train_df = train_df.reset_index(drop=True)
+    val_df = val_df.reset_index(drop=True)
 
-    train_dataset = TreeSizeBoxedDataset(train_df, img_size=args.img_size, augment=args.augment)
-    val_dataset = TreeSizeBoxedDataset(val_df, img_size=args.img_size, augment=False)
+    print("\nTrain class counts:")
+    print(train_df["HEIGHT_CLASS_STR"].value_counts().sort_index())
+    print("\nVal class counts:")
+    print(val_df["HEIGHT_CLASS_STR"].value_counts().sort_index())
 
+    # class weights
+    classes = np.sort(train_df["HEIGHT_CLASS_IDX"].unique())
+    weights = compute_class_weight(
+        class_weight="balanced",
+        classes=classes,
+        y=train_df["HEIGHT_CLASS_IDX"],
+    )
+    class_weights = torch.tensor(weights, dtype=torch.float32).to(device)
+
+    # datasets
+    train_ds = TreeHeightDataset(
+        train_df,
+        image_size=args.image_size,
+        use_depth=args.use_depth,
+        train=True,
+    )
+    val_ds = TreeHeightDataset(
+        val_df,
+        image_size=args.image_size,
+        use_depth=args.use_depth,
+        train=False,
+    )
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
     )
+
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
     )
 
     # model
-    model = MultiHeadModel(
-        backbone_name=args.backbone,
-        head_dims=list(args.head_dims) if args.head_dims else [],
-        dropout=args.dropout,
-        head_bn=args.head_bn,
-        pretrained=args.pretrained,
-    ).to(device)
+    in_channels = 4 if args.use_depth else 3
+    num_classes = int(df["HEIGHT_CLASS_IDX"].nunique())
 
-    if args.freeze_backbone:
-        for p in model.backbone.parameters():
-            p.requires_grad = False
-        print("Backbone frozen: training heads only.")
+    model = build_resnet(
+        backbone=args.backbone,
+        num_classes=num_classes,
+        in_channels=in_channels,
+        device=device,
+        dropout_rate=args.dropout_rate
+    )
 
-    opt = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
 
-    history = []
-    best_val = float("inf")
-    best_epoch = None
-
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        running = 0.0
-        n_seen = 0
-
-        for x, y_h, y_t in train_loader:
-            x, y_h, y_t = x.to(device), y_h.to(device), y_t.to(device)
-            opt.zero_grad(set_to_none=True)
-
-            logits_h, logits_t = model(x)
-            loss_h = F.cross_entropy(logits_h, y_h, ignore_index=-1)
-            loss_t = F.cross_entropy(logits_t, y_t, ignore_index=-1)
-            loss = args.w_height * loss_h + args.w_trunk * loss_t
-
-            loss.backward()
-            opt.step()
-
-            running += float(loss.item()) * x.size(0)
-            n_seen += x.size(0)
-
-        train_loss = running / max(1, n_seen)
-        val_m = evaluate(model, val_loader, device)
-
-        row = {
-            "epoch": epoch,
-            "train_loss": float(train_loss),
-            "val_loss": float(val_m["val_loss"]),
-            "height_acc": val_m["height_acc"],
-            "height_n": int(val_m["height_n"]),
-            "trunk_acc": val_m["trunk_acc"],
-            "trunk_n": int(val_m["trunk_n"]),
-            "lr": float(opt.param_groups[0]["lr"]),
-        }
-        history.append(row)
-
-        print(
-            f"Epoch {epoch:03d} | train_loss={row['train_loss']:.4f} | val_loss={row['val_loss']:.4f} | "
-            f"height_acc={row['height_acc']} (n={row['height_n']}) | trunk_acc={row['trunk_acc']} (n={row['trunk_n']})"
-        )
-
-        with open(metrics_csv, "a", newline="") as f:
-            w = csv.writer(f)
-            w.writerow([row["epoch"], row["train_loss"], row["val_loss"], row["height_acc"], row["height_n"],
-                        row["trunk_acc"], row["trunk_n"], row["lr"]])
-
-        with open(metrics_json, "w") as f:
-            json.dump({"history": history, "best_val_loss": best_val, "best_epoch": best_epoch, "args": vars(args)},
-                      f, indent=2)
-
-        if row["val_loss"] < best_val:
-            best_val = row["val_loss"]
-            best_epoch = epoch
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state": model.state_dict(),
-                    "opt_state": opt.state_dict(),
-                    "best_val_loss": best_val,
-                    "best_epoch": best_epoch,
-                    "history": history,
-                    "args": vars(args),
-                },
-                best_ckpt_path,
-            )
-            print("  saved best:", best_ckpt_path)
-
-    torch.save(
-        {
-            "epoch": args.epochs,
-            "model_state": model.state_dict(),
-            "opt_state": opt.state_dict(),
-            "best_val_loss": best_val,
-            "best_epoch": best_epoch,
-            "history": history,
-            "args": vars(args),
-        },
-        last_ckpt_path,
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=4
     )
 
-    summary = {
-        "rows_total": int(len(df)),
-        "rows_train": int(len(train_df)),
-        "rows_val": int(len(val_df)),
-        "height_labeled_total": int((df["HEIGHT_Y"] != -1).sum()),
-        "trunk_labeled_total": int((df["TRUNK_Y"] != -1).sum()),
-        "best_val_loss": float(best_val),
-        "best_epoch": int(best_epoch) if best_epoch is not None else None,
-        "final_train_loss": float(history[-1]["train_loss"]) if history else None,
-        "final_val_loss": float(history[-1]["val_loss"]) if history else None,
-        "final_height_acc": history[-1]["height_acc"] if history else None,
-        "final_trunk_acc": history[-1]["trunk_acc"] if history else None,
-        "args": vars(args),
-    }
-    with open(summary_json, "w") as f:
-        json.dump(summary, f, indent=2)
+    # save directory
+    models_root = Path(args.out_root) / "tree_models"
+    models_root.mkdir(parents=True, exist_ok=True)
 
-    print("Saved:", best_ckpt_path)
-    print("Saved:", last_ckpt_path)
-    print("Saved:", metrics_csv)
-    print("Saved:", metrics_json)
-    print("Saved:", summary_json)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{args.backbone}_{'rgbd' if args.use_depth else 'rgb'}_{timestamp}"
+    run_dir = models_root / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    best_model_path = run_dir / "best_model.pth"
+    metrics_path = run_dir / "metrics.json"
+    history_path = run_dir / "history.json"
+    config_path = run_dir / "config.json"
+
+    config = {
+        "dataset_dir": str(dataset_dir),
+        "backbone": args.backbone,
+        "num_classes": num_classes,
+        "in_channels": in_channels,
+        "use_depth": args.use_depth,
+        "image_size": args.image_size,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "val_size": args.val_size,
+        "random_state": args.random_state,
+        "num_workers": args.num_workers,
+        "device": str(device),
+    }
+
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=4)
+
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "train_acc": [],
+        "val_acc": [],
+        "val_f1_macro": [],
+        "val_recall_macro": [],
+    }
+
+    best_val_acc = 0.0
+    best_epoch = -1
+
+    print(f"\nSaving training run to: {run_dir}")
+
+    for epoch in range(args.epochs):
+        train_loss, train_acc, _, _ = run_epoch(
+            model, train_loader, criterion, device, optimizer
+        )
+        val_loss, val_acc, val_preds, val_labels = run_epoch(
+            model, val_loader, criterion, device
+        )
+
+        val_f1_macro = f1_score(val_labels, val_preds, average="macro", zero_division=0)
+        val_recall_macro = recall_score(val_labels, val_preds, average="macro", zero_division=0)
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
+        history["val_f1_macro"].append(val_f1_macro)
+        history["val_recall_macro"].append(val_recall_macro)
+
+        print(
+            f"Epoch {epoch+1:03d}/{args.epochs} | "
+            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
+            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} | "
+            f"val_f1={val_f1_macro:.4f} val_recall={val_recall_macro:.4f}"
+        )
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_epoch = epoch + 1
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "epoch": best_epoch,
+                    "val_accuracy": best_val_acc,
+                },
+                best_model_path,
+            )
+
+    with open(history_path, "w") as f:
+        json.dump(history, f, indent=4)
+
+    metrics = {
+        "best_epoch": best_epoch,
+        "best_val_accuracy": float(best_val_acc),
+        "final_val_accuracy": float(history["val_acc"][-1]),
+        "final_val_f1_macro": float(history["val_f1_macro"][-1]),
+        "final_val_recall_macro": float(history["val_recall_macro"][-1]),
+        "n_train": int(len(train_df)),
+        "n_val": int(len(val_df)),
+    }
+
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=4)
+
+    print("\nTraining complete.")
+    print(f"Best val accuracy: {best_val_acc:.4f}")
+    print(f"Best epoch: {best_epoch}")
+    print(f"Saved model to: {best_model_path}")
 
 
 if __name__ == "__main__":
