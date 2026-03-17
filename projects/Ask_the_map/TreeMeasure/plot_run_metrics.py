@@ -18,29 +18,41 @@ from sklearn.metrics import (
 )
 
 
-# =========================================================
-# Load run files
-# =========================================================
+from pathlib import Path
+import json
+
 def load_run(run_path: Path):
     metrics_path = run_path / "metrics.json"
     history_path = run_path / "history.json"
     config_path = run_path / "config.json"
 
-    if not metrics_path.exists():
-        raise FileNotFoundError(f"Missing metrics.json in {run_path}")
+    # ----------------------------
+    # REQUIRED FILES
+    # ----------------------------
     if not history_path.exists():
         raise FileNotFoundError(f"Missing history.json in {run_path}")
-    if not config_path.exists():
-        raise FileNotFoundError(f"Missing config.json in {run_path}")
 
-    with open(metrics_path, "r") as f:
-        metrics = json.load(f)
+    # ----------------------------
+    # OPTIONAL FILE
+    # ----------------------------
+    if config_path.exists():
+        with open(config_path, "r") as f:
+            config = json.load(f)
+    else:
+        print(f"[WARNING] config.json missing in {run_path}")
+        config = None
+    if metrics_path.exists():
+        with open(metrics_path, "r") as f:
+            metrics = json.load(f)
+    else:
+        print(f"[WARNING] metrics.json missing in {run_path}")
+        metrics = None
 
+    # ----------------------------
+    # REQUIRED LOADS
+    # ----------------------------
     with open(history_path, "r") as f:
         history = json.load(f)
-
-    with open(config_path, "r") as f:
-        config = json.load(f)
 
     return metrics, history, config
 
@@ -49,19 +61,66 @@ def load_run(run_path: Path):
 # Training-history diagnostics
 # =========================================================
 def plot_training_diagnostics(history, title_prefix="Model", save_path=None):
-    epochs = np.arange(1, len(history["train_loss"]) + 1)
-    best_epoch = int(np.argmax(history["val_acc"]) + 1)
 
-    train_acc = np.array(history["train_acc"])
-    val_acc = np.array(history["val_acc"])
-    acc_gap = train_acc - val_acc
+    def normalize_history(history):
+        # CASE 1: wrapped dict -> list of epoch dicts
+        if isinstance(history, dict) and "history" in history:
+            history = history["history"]
+
+        # CASE 2: new format = list of epoch dicts
+        if isinstance(history, list):
+            epochs = []
+            train_loss, val_loss = [], []
+            train_acc, val_acc = [], []
+            train_f1, val_f1 = [], []
+
+            for i, h in enumerate(history, start=1):
+                train = h.get("train", {})
+                val = h.get("val", {})
+
+                epochs.append(h.get("epoch", i))
+                train_loss.append(train.get("loss", np.nan))
+                val_loss.append(val.get("loss", np.nan))
+                train_acc.append(train.get("bal_acc", np.nan))
+                val_acc.append(val.get("bal_acc", np.nan))
+                train_f1.append(train.get("macro_f1", np.nan))
+                val_f1.append(val.get("macro_f1", np.nan))
+
+            return {
+                "epochs": np.array(epochs, dtype=float),
+                "train_loss": np.array(train_loss, dtype=float),
+                "val_loss": np.array(val_loss, dtype=float),
+                "train_acc": np.array(train_acc, dtype=float),
+                "val_acc": np.array(val_acc, dtype=float),
+                "train_f1": np.array(train_f1, dtype=float),
+                "val_f1": np.array(val_f1, dtype=float),
+            }
+
+        # CASE 3: old flat dict
+        if isinstance(history, dict) and "train_loss" in history:
+            n = len(history.get("train_loss", []))
+            return {
+                "epochs": np.arange(1, n + 1),
+                "train_loss": np.array(history.get("train_loss", [np.nan] * n), dtype=float),
+                "val_loss": np.array(history.get("val_loss", [np.nan] * n), dtype=float),
+                "train_acc": np.array(history.get("train_acc", [np.nan] * n), dtype=float),
+                "val_acc": np.array(history.get("val_acc", [np.nan] * n), dtype=float),
+                "train_f1": np.array(history.get("train_f1", [np.nan] * n), dtype=float),
+                "val_f1": np.array(history.get("val_f1", [np.nan] * n), dtype=float),
+            }
+
+        raise ValueError(f"Unknown history format: {type(history)}")
+    
+    hist = normalize_history(history)
+    acc_gap = hist["train_acc"] - hist["val_acc"]
+    best_epoch = np.nanargmax(hist["val_acc"]) + 1  # +1 for 1-based epoch indexing
 
     fig = plt.figure(figsize=(16, 10))
 
     # Top: loss
     ax1 = plt.subplot2grid((2, 3), (0, 0), colspan=3)
-    ax1.plot(epochs, history["train_loss"], marker="o", label="Train loss")
-    ax1.plot(epochs, history["val_loss"], marker="o", label="Val loss")
+    ax1.plot(hist["epochs"], hist["train_loss"], marker="o", label="Train loss")
+    ax1.plot(hist["epochs"], hist["val_loss"], marker="o", label="Val loss")
     ax1.axvline(best_epoch, color="red", linestyle="--", label=f"Best val acc epoch {best_epoch}")
     ax1.set_title(f"{title_prefix} — Loss")
     ax1.set_xlabel("Epoch")
@@ -69,43 +128,46 @@ def plot_training_diagnostics(history, title_prefix="Model", save_path=None):
     ax1.grid(True, alpha=0.3)
     ax1.legend()
 
-    # Bottom left: accuracy
-    ax2 = plt.subplot2grid((2, 3), (1, 0))
-    ax2.plot(epochs, history["train_acc"], marker="o", label="Train acc")
-    ax2.plot(epochs, history["val_acc"], marker="o", label="Val acc")
-    ax2.fill_between(epochs, history["train_acc"], history["val_acc"], alpha=0.12)
-    ax2.axvline(best_epoch, color="red", linestyle="--")
-    ax2.set_title("Accuracy")
-    ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Accuracy")
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
+    if isinstance(hist["train_acc"], np.ndarray) and isinstance(hist["val_acc"], np.ndarray):
+        # Bottom left: accuracy
+        ax2 = plt.subplot2grid((2, 3), (1, 0))
+        ax2.plot(hist["epochs"], hist["train_acc"], marker="o", label="Train acc")
+        ax2.plot(hist["epochs"], hist["val_acc"], marker="o", label="Val acc")
+        ax2.fill_between(hist["epochs"], hist["train_acc"], hist["val_acc"], alpha=0.12)
+        ax2.axvline(best_epoch, color="red", linestyle="--")
+        ax2.set_title("Accuracy")
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("Accuracy")
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
 
-    ax2.text(
-        0.03, 0.05,
-        f"Mean accuracy gap = {acc_gap.mean()*100:.2f}%",
-        transform=ax2.transAxes,
-        fontsize=11,
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8)
-    )
+        ax2.text(
+            0.03, 0.05,
+            f"Mean accuracy gap = {acc_gap.mean()*100:.2f}%",
+            transform=ax2.transAxes,
+            fontsize=11,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8)
+        )
 
-    # Bottom middle: F1
-    ax3 = plt.subplot2grid((2, 3), (1, 1))
-    ax3.plot(epochs, history["val_f1_macro"], marker="o")
-    ax3.axvline(best_epoch, color="red", linestyle="--")
-    ax3.set_title("Validation Macro F1")
-    ax3.set_xlabel("Epoch")
-    ax3.set_ylabel("F1-score")
-    ax3.grid(True, alpha=0.3)
+    if isinstance(hist["train_f1"], np.ndarray) or isinstance(hist["val_f1"], np.ndarray):
+        # Bottom middle: F1
+        ax3 = plt.subplot2grid((2, 3), (1, 1))
+        ax3.plot(hist["epochs"], hist["val_f1"], marker="o")
+        ax3.axvline(best_epoch, color="red", linestyle="--")
+        ax3.set_title("Validation Macro F1")
+        ax3.set_xlabel("Epoch")
+        ax3.set_ylabel("F1-score")
+        ax3.grid(True, alpha=0.3)
 
-    # Bottom right: recall
-    ax4 = plt.subplot2grid((2, 3), (1, 2))
-    ax4.plot(epochs, history["val_recall_macro"], marker="o")
-    ax4.axvline(best_epoch, color="red", linestyle="--")
-    ax4.set_title("Validation Macro Recall")
-    ax4.set_xlabel("Epoch")
-    ax4.set_ylabel("Recall")
-    ax4.grid(True, alpha=0.3)
+    if isinstance(hist.get("val_recall_macro"), np.ndarray):
+        # Bottom right: recall
+        ax4 = plt.subplot2grid((2, 3), (1, 2))
+        ax4.plot(hist["epochs"], hist["val_recall_macro"], marker="o")
+        ax4.axvline(best_epoch, color="red", linestyle="--")
+        ax4.set_title("Validation Macro Recall")
+        ax4.set_xlabel("Epoch")
+        ax4.set_ylabel("Recall")
+        ax4.grid(True, alpha=0.3)
 
     plt.tight_layout()
 
@@ -222,9 +284,11 @@ def main():
 
     run_name = run_path.name
     print(f"Loaded run: {run_name}")
-    print(f"Best epoch: {metrics.get('best_epoch')}")
-    print(f"Best validation accuracy: {metrics.get('best_val_accuracy')}")
-    print(f"Config: {config}")
+    if metrics is not None:
+        print(f"Best epoch: {metrics.get('best_epoch')}")
+        print(f"Best validation accuracy: {metrics.get('best_val_accuracy')}")
+    if config is not None:
+        print(f"Config: {config}")  
 
     # Always save training history diagnostics
     plot_training_diagnostics(
