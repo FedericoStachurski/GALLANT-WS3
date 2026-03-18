@@ -8,7 +8,7 @@ Pipeline:
 1. Read input table (.xlsx or .csv)
 2. Keep TREE == yes
 3. Explode MEDIA_2635_* columns -> one row per image
-4. Derive height and trunk labels
+4. Derive height and diameter labels
 5. Download image in memory
 6. CLIP filter -> keep likely tree images
 7. GroundingDINO -> detect best tree box
@@ -20,7 +20,7 @@ Example:
 python build_tree_dataset.py \
   --input "/path/to/communiMap data March 26.xlsx" \
   --out_root "/home/fss6k/datasets/tree_dataset" \
-  --dataset_name "communimap_trees_march26" \
+  --dataset_name "communimap_trees_march26"
 """
 
 from __future__ import annotations
@@ -31,16 +31,16 @@ import re
 import sys
 from io import BytesIO
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import requests
 from PIL import Image
 from tqdm import tqdm
-from datetime import datetime
 from faker import Faker
-fake = Faker()
 
+fake = Faker()
 
 # --------------------------------------------------
 # Shared utilities
@@ -142,47 +142,32 @@ def add_height_labels(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def add_trunk_labels(df: pd.DataFrame) -> pd.DataFrame:
+def add_diameter_labels(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Use actual measurement ranges from circumference in cm.
+    Create fixed trunk diameter (DBH) classes from circumference in cm.
+
+    Diameter bins are applied to DBH_CM:
+      <2, 2-20, 20-40, 40-60, 60+
     """
     df = df.copy()
+
     df["CIRCUMFERENCE_IN_CM_CLEAN"] = df["CIRCUMFERENCE_IN_CM"].map(extract_numeric)
     df["DBH_CM"] = df["CIRCUMFERENCE_IN_CM_CLEAN"] / np.pi
 
-    valid = df["CIRCUMFERENCE_IN_CM_CLEAN"].notna()
-    if valid.sum() == 0:
-        df["TRUNK_CLASS_STR"] = np.nan
-        df["TRUNK_CLASS_IDX"] = np.nan
-        return df
+    bins = [-np.inf, 2, 20, 40, 60, np.inf]
+    labels = ["<2", "2-20", "20-40", "40-60", "60+"]
 
-    q = df.loc[valid, "CIRCUMFERENCE_IN_CM_CLEAN"].quantile([0, 0.25, 0.5, 0.75, 1]).values
-    q = np.unique(q)
-
-    if len(q) < 5:
-        q = np.array([
-            df.loc[valid, "CIRCUMFERENCE_IN_CM_CLEAN"].min(),
-            50,
-            100,
-            150,
-            df.loc[valid, "CIRCUMFERENCE_IN_CM_CLEAN"].max() + 1e-6,
-        ])
-
-    trunk_labels = [
-        f"{int(q[i])}-{int(q[i+1])}" if i < len(q) - 2 else f"{int(q[i])}+"
-        for i in range(len(q) - 1)
-    ]
-    trunk_map = {k: i for i, k in enumerate(trunk_labels)}
-
-    df["TRUNK_CLASS_STR"] = pd.cut(
-        df["CIRCUMFERENCE_IN_CM_CLEAN"],
-        bins=q,
-        labels=trunk_labels,
-        include_lowest=True,
+    # [-inf,2), [2,20), [20,40), [40,60), [60,inf)
+    df["DIAMETER_CLASS_STR"] = pd.cut(
+        df["DBH_CM"],
+        bins=bins,
+        labels=labels,
         right=False
     ).astype("object")
 
-    df["TRUNK_CLASS_IDX"] = df["TRUNK_CLASS_STR"].map(trunk_map)
+    label_map = {k: i for i, k in enumerate(labels)}
+    df["DIAMETER_CLASS_IDX"] = df["DIAMETER_CLASS_STR"].map(label_map)
+
     return df
 
 
@@ -256,8 +241,9 @@ def main():
     if df_img.empty:
         raise RuntimeError("No media rows found.")
 
+    # Derive labels here, before image processing
     df_img = add_height_labels(df_img)
-    df_img = add_trunk_labels(df_img)
+    df_img = add_diameter_labels(df_img)
 
     # ------------------------------------------
     # 2. Load CLIP, DINO, Depth once
@@ -385,8 +371,8 @@ def main():
         "HEIGHT_CLASS_IDX",
         "CIRCUMFERENCE_IN_CM_CLEAN",
         "DBH_CM",
-        "TRUNK_CLASS_STR",
-        "TRUNK_CLASS_IDX",
+        "DIAMETER_CLASS_STR",
+        "DIAMETER_CLASS_IDX",
         "tree_score",
         "top_prompt",
     ]
@@ -403,7 +389,7 @@ def main():
         "n_rows_final": int(len(df_img)),
         "n_unique_ids": int(df_img["ID"].nunique()),
         "n_height_labeled": int(df_img["HEIGHT_CLASS_IDX"].notna().sum()),
-        "n_trunk_labeled": int(df_img["TRUNK_CLASS_IDX"].notna().sum()),
+        "n_diameter_labeled": int(df_img["DIAMETER_CLASS_IDX"].notna().sum()),
     }
 
     with open(manifest_dir / "summary.json", "w") as f:

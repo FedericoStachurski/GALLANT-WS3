@@ -61,6 +61,7 @@ def load_run(run_path: Path):
 # Training-history diagnostics
 # =========================================================
 def plot_training_diagnostics(history, title_prefix="Model", save_path=None):
+    print(history)
 
     def normalize_history(history):
         # CASE 1: wrapped dict -> list of epoch dicts
@@ -92,7 +93,7 @@ def plot_training_diagnostics(history, title_prefix="Model", save_path=None):
                 "val_loss": np.array(val_loss, dtype=float),
                 "train_acc": np.array(train_acc, dtype=float),
                 "val_acc": np.array(val_acc, dtype=float),
-                "train_f1": np.array(train_f1, dtype=float),
+                # "train_f1": np.array(train_f1, dtype=float),
                 "val_f1": np.array(val_f1, dtype=float),
             }
 
@@ -105,10 +106,15 @@ def plot_training_diagnostics(history, title_prefix="Model", save_path=None):
                 "val_loss": np.array(history.get("val_loss", [np.nan] * n), dtype=float),
                 "train_acc": np.array(history.get("train_acc", [np.nan] * n), dtype=float),
                 "val_acc": np.array(history.get("val_acc", [np.nan] * n), dtype=float),
-                "train_f1": np.array(history.get("train_f1", [np.nan] * n), dtype=float),
-                "val_f1": np.array(history.get("val_f1", [np.nan] * n), dtype=float),
+                "val_f1_macro": np.array(
+                    history.get("val_f1_macro", history.get("val_f1_macro", [np.nan] * n)),
+                    dtype=float
+                ),
+                "val_recall_macro": np.array(
+                    history.get("val_recall_macro", [np.nan] * n),
+                    dtype=float
+                ),
             }
-
         raise ValueError(f"Unknown history format: {type(history)}")
     
     hist = normalize_history(history)
@@ -149,10 +155,10 @@ def plot_training_diagnostics(history, title_prefix="Model", save_path=None):
             bbox=dict(boxstyle="round", facecolor="white", alpha=0.8)
         )
 
-    if isinstance(hist["train_f1"], np.ndarray) or isinstance(hist["val_f1"], np.ndarray):
+    if  isinstance(hist["val_f1_macro"], np.ndarray):
         # Bottom middle: F1
         ax3 = plt.subplot2grid((2, 3), (1, 1))
-        ax3.plot(hist["epochs"], hist["val_f1"], marker="o")
+        ax3.plot(hist["epochs"], hist["val_f1_macro"], marker="o")
         ax3.axvline(best_epoch, color="red", linestyle="--")
         ax3.set_title("Validation Macro F1")
         ax3.set_xlabel("Epoch")
