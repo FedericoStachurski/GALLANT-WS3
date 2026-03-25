@@ -157,22 +157,20 @@ def build_height_feature_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, list[s
     df = df.copy()
 
     feat_cols = [
-        "HEIGHT_FEAT_lt5",
+        "HEIGHT_FEAT_0_5",
         "HEIGHT_FEAT_5_10",
         "HEIGHT_FEAT_10_15",
-        "HEIGHT_FEAT_15_20",
-        "HEIGHT_FEAT_20plus",
+        "HEIGHT_FEAT_15plus",
     ]
 
     for c in feat_cols:
         df[c] = 0.0
 
     prob_map = {
-        "HEIGHT_FEAT_lt5": "HEIGHT_PROB_lt5",
+        "HEIGHT_FEAT_0_5": "HEIGHT_PROB_0_5",
         "HEIGHT_FEAT_5_10": "HEIGHT_PROB_5_10",
         "HEIGHT_FEAT_10_15": "HEIGHT_PROB_10_15",
-        "HEIGHT_FEAT_15_20": "HEIGHT_PROB_15_20",
-        "HEIGHT_FEAT_20plus": "HEIGHT_PROB_20plus",
+        "HEIGHT_FEAT_15plus": "HEIGHT_PROB_15plus",
     }
 
     prob_cols_present = all(col in df.columns for col in prob_map.values())
@@ -309,7 +307,7 @@ def predict_missing_diameters(
     use_depth = bool(config.get("use_depth", False))
     image_size = int(config.get("image_size", 224))
     configured_height_cols = config.get("height_feature_cols", ["HEIGHT_CLASS_FINAL_IDX"])
-    class_names = config.get("class_names", ["<2", "2-20", "20-40", "40-60", "60+"])
+    class_names = config.get("class_names", ["0-20", "20-40", "40-60", "60+"])
     idx_to_class = {i: c for i, c in enumerate(class_names)}
 
     # Build height features if the run expects probability-style features

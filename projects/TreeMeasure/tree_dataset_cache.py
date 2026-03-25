@@ -121,15 +121,20 @@ def explode_media(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_height_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create fixed height classes.
+
+    Height bins:
+      0-5, 5-10, 10-15, 15+
+    """
     df = df.copy()
 
     df["TREE_HEIGHT_IN_METERS_CLEAN"] = df["TREE_HEIGHT_IN_METERS"].map(extract_numeric)
     df["ESTIMATED_TREE_HEIGHT_CLEAN"] = df["ESTIMATED_TREE_HEIGHT"].map(extract_numeric)
     df["HEIGHT_VALUE_M"] = df["TREE_HEIGHT_IN_METERS_CLEAN"].fillna(df["ESTIMATED_TREE_HEIGHT_CLEAN"])
 
-    bins = [0, 5, 10, 15, 20, np.inf]
-    labels = ["<5", "5-10", "10-15", "15-20", "20+"]
-    label_map = {k: i for i, k in enumerate(labels)}
+    bins = [-np.inf, 5, 10, 15, np.inf]
+    labels = ["0-5", "5-10", "10-15", "15+"]
 
     df["HEIGHT_CLASS_STR"] = pd.cut(
         df["HEIGHT_VALUE_M"],
@@ -138,7 +143,9 @@ def add_height_labels(df: pd.DataFrame) -> pd.DataFrame:
         right=False
     ).astype("object")
 
+    label_map = {k: i for i, k in enumerate(labels)}
     df["HEIGHT_CLASS_IDX"] = df["HEIGHT_CLASS_STR"].map(label_map)
+
     return df
 
 
@@ -146,18 +153,18 @@ def add_diameter_labels(df: pd.DataFrame) -> pd.DataFrame:
     """
     Create fixed trunk diameter (DBH) classes from circumference in cm.
 
-    Diameter bins are applied to DBH_CM:
-      <2, 2-20, 20-40, 40-60, 60+
+    Diameter bins:
+      0-20, 20-40, 40-60, 60+
     """
     df = df.copy()
 
     df["CIRCUMFERENCE_IN_CM_CLEAN"] = df["CIRCUMFERENCE_IN_CM"].map(extract_numeric)
     df["DBH_CM"] = df["CIRCUMFERENCE_IN_CM_CLEAN"] / np.pi
 
-    bins = [-np.inf, 2, 20, 40, 60, np.inf]
-    labels = ["<2", "2-20", "20-40", "40-60", "60+"]
+    bins = [-np.inf, 20, 40, 60, np.inf]
+    labels = ["0-20", "20-40", "40-60", "60+"]
 
-    # [-inf,2), [2,20), [20,40), [40,60), [60,inf)
+    # [0,20), [20,40), [40,60), [60,inf)
     df["DIAMETER_CLASS_STR"] = pd.cut(
         df["DBH_CM"],
         bins=bins,

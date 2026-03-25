@@ -131,7 +131,11 @@ class TreeDiameterDataset(Dataset):
         # -------------------------
         # Height features
         # -------------------------
-        x_tab = row[self.height_feature_cols].astype(np.float32).values
+        if len(self.height_feature_cols) > 0:
+            x_tab = row[self.height_feature_cols].astype(np.float32).values
+        else:
+            x_tab = np.zeros((0,), dtype=np.float32)
+
         x_tab = torch.tensor(x_tab, dtype=torch.float32)
 
         # -------------------------
@@ -192,23 +196,33 @@ class ResNetDiameterWithHeight(nn.Module):
 
         image_feat_dim = self.backbone.fc.in_features
         self.backbone.fc = nn.Identity()
+        
+        self.use_tabular = n_tabular_features > 0
 
-        self.tabular_head = nn.Sequential(
-            nn.Linear(n_tabular_features, tab_hidden_dim),
-            nn.ReLU(),
-        )
+        if self.use_tabular:
+            self.tabular_head = nn.Sequential(
+                nn.Linear(n_tabular_features, tab_hidden_dim),
+                nn.ReLU(),
+            )
+            final_in_dim = image_feat_dim + tab_hidden_dim
+        else:
+            self.tabular_head = None
+            final_in_dim = image_feat_dim
 
         self.classifier = nn.Sequential(
             nn.Dropout(p=dropout_rate),
-            nn.Linear(image_feat_dim + tab_hidden_dim, num_classes),
+            nn.Linear(final_in_dim, num_classes),
         )
 
         self.to(device)
 
     def forward(self, x_img, x_tab):
         img_feat = self.backbone(x_img)
-        tab_feat = self.tabular_head(x_tab)
-        feat = torch.cat([img_feat, tab_feat], dim=1)
+        if self.use_tabular:
+            tab_feat = self.tabular_head(x_tab)
+            feat = torch.cat([img_feat, tab_feat], dim=1)
+        else:
+            feat = img_feat
         out = self.classifier(feat)
         return out
 
@@ -280,7 +294,7 @@ def find_dataset_dir(out_root: Path, dataset_name: str | None, full_dataset_path
     return matches[-1]
 
 
-def load_manifest(dataset_dir: Path, use_height_probs: bool = False) -> tuple[pd.DataFrame, list[str]]:
+def load_manifest(dataset_dir: Path, use_height_probs: bool = False, use_height_feature: bool = False) -> tuple[pd.DataFrame, list[str]]:
     manifest_candidates = [
         dataset_dir / "manifests" / "tree_dataset_manifest_with_height_predictions.csv",
         dataset_dir / "manifests" / "tree_dataset_manifest.csv",
@@ -299,7 +313,6 @@ def load_manifest(dataset_dir: Path, use_height_probs: bool = False) -> tuple[pd
 
     df = pd.read_csv(manifest_path)
 
-    # ---- required columns for diameter training
     required = ["RGB_CROP_PATH", "DIAMETER_CLASS_IDX", "DIAMETER_CLASS_STR"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -308,8 +321,9 @@ def load_manifest(dataset_dir: Path, use_height_probs: bool = False) -> tuple[pd
     if "DEPTH_PATH" not in df.columns:
         df["DEPTH_PATH"] = np.nan
 
-    # ---- choose height features
-    if use_height_probs:
+    if not use_height_feature:
+        height_feature_cols = []
+    elif use_height_probs:
         height_feature_cols = sorted([c for c in df.columns if c.startswith("HEIGHT_PROB_")])
         if len(height_feature_cols) == 0:
             raise ValueError(
@@ -323,10 +337,7 @@ def load_manifest(dataset_dir: Path, use_height_probs: bool = False) -> tuple[pd
         elif "HEIGHT_CLASS_IDX" in df.columns:
             height_feature_cols = ["HEIGHT_CLASS_IDX"]
         else:
-            raise ValueError(
-                "No usable height feature column found. Expected one of "
-                "HEIGHT_CLASS_FINAL_IDX, HEIGHT_CLASS_PRED_IDX, or HEIGHT_CLASS_IDX."
-            )
+            height_feature_cols = []
 
     needed_for_training = ["RGB_CROP_PATH", "DIAMETER_CLASS_IDX"] + height_feature_cols
     df = df.dropna(subset=needed_for_training).copy()
@@ -364,6 +375,7 @@ def main():
         choices=["resnet18", "resnet34", "resnet50", "resnet101"],
     )
     ap.add_argument("--use_depth", action="store_true")
+    ap.add_argument("--use_height_features", type=bool, default=False)
     ap.add_argument("--use_height_probs", action="store_true")
     ap.add_argument("--image_size", type=int, default=224)
 
@@ -386,6 +398,7 @@ def main():
     df, height_feature_cols = load_manifest(
         dataset_dir=dataset_dir,
         use_height_probs=args.use_height_probs,
+        use_height_feature= args.use_height_features,
     )
 
     if args.use_depth:

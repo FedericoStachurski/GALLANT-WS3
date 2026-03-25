@@ -184,7 +184,7 @@ def predict_missing_heights(
 
     use_depth = bool(config.get("use_depth", False))
     image_size = int(config.get("image_size", 224))
-    class_names = config.get("class_names", ["<5", "5-10", "10-15", "15-20", "20+"])
+    class_names = config.get("class_names", ["0-5", "5-10", "10-15", "15+"])
     idx_to_class = {i: c for i, c in enumerate(class_names)}
 
     missing_mask = df["HEIGHT_CLASS_IDX"].isna()
@@ -261,6 +261,8 @@ def predict_missing_heights(
     pred_table["HEIGHT_CLASS_PRED_CONF"] = all_conf
 
     probs_arr = np.array(all_probs)
+    print("Probs array shape:", probs_arr.shape)
+    print("Class names:", class_names)
     for i, cls in enumerate(class_names):
         pred_table[f"HEIGHT_PROB_{safe_class_name(cls)}"] = probs_arr[:, i]
 
