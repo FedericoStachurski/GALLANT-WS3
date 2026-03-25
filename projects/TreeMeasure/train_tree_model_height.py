@@ -393,7 +393,7 @@ def main():
     models_root.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"{args.backbone}_{'rgbd' if args.use_depth else 'rgb'}_{timestamp}"
+    run_name = f"tree_height_models/height_{args.backbone}_{'rgbd' if args.use_depth else 'rgb'}_{timestamp}"
     run_dir = models_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
