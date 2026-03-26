@@ -7,6 +7,7 @@ Usage:
     df = load_communimap_data("/path/to/communimap_spots.csv", use_blip=True)
 """
 
+from pathlib import Path
 import pandas as pd
 import numpy as np
 
@@ -29,28 +30,43 @@ def sniff_delimiter(path):
 
 def load_raw_dataframe(path):
     """
-    Attempts to load the CSV with auto-detected delimiter.
-    Falls back to comma or semicolon if needed.
+    Load either a CSV or an Excel file.
+    - .csv  -> tries auto/comma/semicolon
+    - .xlsx/.xls -> uses read_excel
     """
-    try:
-        df = pd.read_csv(path, sep=None, engine="python")
-        return df
-    except Exception as e1:
-        print("Auto-detect failed, trying comma...")
+    path = Path(path)
 
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    suffix = path.suffix.lower()
+
+    if suffix in [".xlsx", ".xls"]:
+        print(f"Detected Excel file: {path}")
+        return pd.read_excel(path)
+
+    if suffix == ".csv":
         try:
-            df = pd.read_csv(path, sep=",")
+            df = pd.read_csv(path, sep=None, engine="python")
             return df
-        except Exception as e2:
-            print("Comma failed, trying semicolon...")
+        except Exception as e1:
+            print("Auto-detect failed, trying comma...")
 
             try:
-                df = pd.read_csv(path, sep=";")
+                df = pd.read_csv(path, sep=",")
                 return df
-            except Exception as e3:
-                raise ValueError(
-                    f"Could not parse CSV.\nAuto: {e1}\nComma: {e2}\nSemicolon: {e3}"
-                )
+            except Exception as e2:
+                print("Comma failed, trying semicolon...")
+
+                try:
+                    df = pd.read_csv(path, sep=";")
+                    return df
+                except Exception as e3:
+                    raise ValueError(
+                        f"Could not parse CSV.\nAuto: {e1}\nComma: {e2}\nSemicolon: {e3}"
+                    )
+
+    raise ValueError(f"Unsupported file type: {suffix}")
 
 
 def pick_primary_image(row, media_cols):
