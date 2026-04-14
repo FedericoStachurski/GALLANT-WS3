@@ -18,7 +18,7 @@ What it does
 
 Usage
 -----
-python embed_local_multimodal.py <path_to_data> [output_name] \
+python embed_local.py <path_to_data> [output_name] \
     --vlm siglip \
     --vl_model google/siglip2-base-patch16-384 \
     --blip_model Salesforce/blip-image-captioning-base \
@@ -30,18 +30,18 @@ python embed_local_multimodal.py <path_to_data> [output_name] \
 Examples
 --------
 # Use default SigLIP2
-python embed_local_multimodal.py "/path/to/data.xlsx" out_name --vlm siglip
+python embed_local_.py "/path/to/data.xlsx" out_name --vlm siglip
 
 # Use default CLIP
-python embed_local_multimodal.py "/path/to/data.xlsx" out_name --vlm clip
+python embed_local.py "/path/to/data.xlsx" out_name --vlm clip
 
 # Use a local SigLIP2 folder
-python embed_local_multimodal.py "/path/to/data.xlsx" out_name \
+python embed_local.py "/path/to/data.xlsx" out_name \
     --vlm siglip \
     --vl_model /home/fss6k/models/siglip2-base-patch16-384
 
 # Use a local BLIP folder
-python embed_local_multimodal.py "/path/to/data.xlsx" out_name \
+python embed_local.py "/path/to/data.xlsx" out_name \
     --blip_model /home/fss6k/models/blip-image-captioning-base
 """
 

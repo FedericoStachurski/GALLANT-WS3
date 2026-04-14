@@ -21,6 +21,7 @@ What it does
 - Searches both indices
 - Fuses scores:
     score = w_text * score_text + w_img * score_image
+- Only returns entries that have an associated image
 - Displays results on a Folium map
 - Optionally saves result images locally
 
@@ -94,6 +95,11 @@ def resolve_model_source(model_spec: str) -> str:
         return resolved
     print(f"[MODEL] Using model ID: {model_spec}")
     return model_spec
+
+
+def has_valid_image(item) -> bool:
+    img = item.get("primary_image")
+    return isinstance(img, str) and img.strip() != ""
 
 
 def download_image(url, save_path, timeout=7):
@@ -244,6 +250,9 @@ def main():
     if len(meta) != img_embs.shape[0]:
         raise ValueError("Metadata length does not match number of image embeddings.")
 
+    n_with_images = sum(has_valid_image(item) for item in meta)
+    print(f"[LOAD] Entries with valid images: {n_with_images} / {len(meta)}")
+
     # -------------------------
     # Build FAISS indices
     # -------------------------
@@ -375,7 +384,15 @@ def main():
             return pos / len(scores_list)
 
         fused = []
+        skipped_no_image = 0
+
         for idx in candidate_idxs:
+            item = meta[idx]
+
+            if not has_valid_image(item):
+                skipped_no_image += 1
+                continue
+
             st = score_text_dict.get(idx, 0.0)
             si = score_img_dict.get(idx, 0.0)
 
@@ -387,6 +404,8 @@ def main():
                 continue
 
             fused.append((idx, s, st, si, p_text, p_img))
+
+        print(f"[SEARCH] Skipped {skipped_no_image} candidate results with no image.")
 
         fused.sort(key=lambda x: x[1], reverse=True)
 
@@ -420,7 +439,7 @@ def main():
             return None
 
         if center is None:
-            center = (55.8721, -4.2892)  # University of Glasgow
+            center = (55.8721, -4.2892)
 
         m = folium.Map(location=center, zoom_start=zoom_start)
 
@@ -435,20 +454,25 @@ def main():
 
         for r in results:
             lat, lon = r["lat"], r["lon"]
-            text = (r["text"] or "")[:200].replace("\n", " ") + "…"
+            text = (r["text"] or "")[:200].replace("\n", " ")
             img = r["image"]
             score = r["score"]
+            entry_id = r["id"]
 
             html = f"""
             <div style="width:240px;">
+            <b>ID: {entry_id}</b><br>
             <b>Score: {score:.3f}</b><br>
             <b>Text Score: {r["score_text"]:.3f} (p: {r["p_text"]:.3f} %)</b><br>
             <b>Image Score: {r["score_img"]:.3f} (p: {r["p_img"]:.3f} %)</b><br>
-            <p style="font-size:11px;">{text}</p>
-            {'<img src="' + img + '" width="220">' if img else ''}
+            <p style="font-size:11px;">{text}...</p>
+            <img src="{img}" width="220">
             </div>
             """
             popup = folium.Popup(html, max_width=260)
+
+            # Show ID directly on the map as tooltip as well
+            tooltip = folium.Tooltip(f"ID: {entry_id}")
 
             folium.CircleMarker(
                 location=(lat, lon),
@@ -457,6 +481,7 @@ def main():
                 fill_opacity=0.85,
                 color="red",
                 popup=popup,
+                tooltip=tooltip,
             ).add_to(m)
 
         return m
@@ -515,10 +540,10 @@ def main():
             w_img=W_IMG,
         )
 
-        print(f"[SEARCH] Got {len(results)} results after fusion + threshold.\n")
+        print(f"[SEARCH] Got {len(results)} image-backed results after fusion + threshold.\n")
 
         if not results:
-            print("[MAP] No results above threshold — map not updated.")
+            print("[MAP] No image-backed results above threshold — map not updated.")
             print("      Try lowering the threshold or changing the query.\n")
             continue
 
