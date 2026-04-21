@@ -19,29 +19,21 @@ What it does
     - clip   -> SentenceTransformers CLIP
     - siglip -> Google SigLIP2
 - Searches both indices
-- Fuses scores:
-    score = w_text * score_text + w_img * score_image
+- Supports fusion modes:
+    - weighted : w_text * norm_text + w_img * norm_img
+    - rrf      : reciprocal rank fusion
+    - text     : text-only ranking
+    - image    : image-only ranking
 - Only returns entries that have an associated image
 - Displays results on a Folium map
 - Optionally saves result images locally
 
-Examples
---------
-# Query embeddings made with SigLIP2
-python prompt_the_map.py \
-    --prefix /home/fss6k/embedded_data_CM/March2026 \
-    --vlm siglip
-
-# Query embeddings made with CLIP
-python prompt_the_map.py \
-    --prefix /home/fss6k/embedded_data_CM/March2026_clip \
-    --vlm clip
-
-# Query embeddings made with a local SigLIP2 folder
-python prompt_the_map.py \
-    --prefix /home/fss6k/embedded_data_CM/March2026 \
-    --vlm siglip \
-    --vl_model /home/fss6k/models/siglip2-base-patch16-384
+Extras
+------
+- Saves score distribution plots for debugging
+- Supports a VALIDATE command that evaluates retrieval for a fixed tree query
+  using supervision from metadata flags such as:
+      Tree Colabor, Tree Type, TREE, etc.
 """
 
 import os
@@ -60,6 +52,8 @@ from folium.plugins import HeatMap
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
 from transformers import AutoProcessor, AutoModel
+import matplotlib.pyplot as plt
+import pandas as pd
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -124,6 +118,40 @@ def load_siglip_model(model_spec: str):
     return processor, model
 
 
+def str_to_bool(x):
+    if isinstance(x, bool):
+        return x
+    if x is None:
+        return False
+    if isinstance(x, (int, float)):
+        return x != 0
+    s = str(x).strip().lower()
+    return s in {"true", "1", "yes", "y", "tree", "trees"}
+
+
+def get_first_present(item, field_names):
+    for f in field_names:
+        if f in item:
+            return item.get(f)
+    return None
+
+
+def safe_filename(s: str) -> str:
+    cleaned = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in s.strip())
+    cleaned = cleaned.strip("_")
+    return cleaned[:100] if cleaned else "query"
+
+
+def parse_k_list(s: str):
+    vals = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        vals.append(int(part))
+    return vals
+
+
 def build_parser():
     p = argparse.ArgumentParser()
 
@@ -163,14 +191,28 @@ def build_parser():
         required=False,
         type=float,
         default=0.7,
-        help="Weight for text similarity in fusion (0–1).",
+        help="Weight for text similarity in weighted fusion.",
     )
     p.add_argument(
         "--w_img",
         required=False,
         type=float,
         default=0.3,
-        help="Weight for image similarity in fusion (0–1).",
+        help="Weight for image similarity in weighted fusion.",
+    )
+    p.add_argument(
+        "--fusion",
+        required=False,
+        choices=["weighted", "rrf", "text", "image"],
+        default="weighted",
+        help="Fusion mode: weighted, rrf, text, or image.",
+    )
+    p.add_argument(
+        "--rrf_k",
+        required=False,
+        type=int,
+        default=60,
+        help="Constant used for Reciprocal Rank Fusion (larger = flatter contributions).",
     )
     p.add_argument(
         "--vlm",
@@ -184,6 +226,26 @@ def build_parser():
         required=False,
         default=None,
         help="Optional local path or model ID overriding the default VLM.",
+    )
+
+    # Validation options
+    p.add_argument(
+        "--validate_query",
+        required=False,
+        default="trees",
+        help="Query used when VALIDATE mode is triggered.",
+    )
+    p.add_argument(
+        "--validate_flag_fields",
+        required=False,
+        default="TREE",
+        help="Comma-separated metadata field names to try for supervision labels.",
+    )
+    p.add_argument(
+        "--validate_k_list",
+        required=False,
+        default="5,10,20,50,100,200,500",
+        help="Comma-separated K values for Precision@K / Recall@K during VALIDATE.",
     )
 
     return p
@@ -200,6 +262,11 @@ def main():
     THRESHOLD = args.threshold
     W_TEXT = args.w_text
     W_IMG = args.w_img
+    FUSION_DEFAULT = args.fusion
+    RRF_K = args.rrf_k
+    VALIDATE_QUERY = args.validate_query
+    VALIDATE_FLAG_FIELDS = [x.strip() for x in args.validate_flag_fields.split(",") if x.strip()]
+    VALIDATE_K_LIST = parse_k_list(args.validate_k_list)
 
     model_info = MODEL_REGISTRY[args.vlm]
     vlm_type = model_info["type"]
@@ -209,9 +276,22 @@ def main():
         os.makedirs("./maps", exist_ok=True)
         MAP_PATH = os.path.join("./maps", MAP_PATH)
 
+    df = None
+    if CSV_PATH:
+        try:
+            if CSV_PATH.lower().endswith(".csv"):
+                df = pd.read_csv(CSV_PATH)
+            elif CSV_PATH.lower().endswith((".xlsx", ".xls")):
+                df = pd.read_excel(CSV_PATH)
+            else:
+                print(f"[WARNING] Unsupported CSV file format: {CSV_PATH}")
+        except Exception as e:
+            print(f"[ERROR] Failed to load CSV file: {e}")
+
     TEXT_EMB_PATH = PREFIX + "_text.npy"
     IMG_EMB_PATH = PREFIX + "_image.npy"
     META_PATH = PREFIX + "_meta.json"
+    PLOTS_PATH = PREFIX
 
     print(f"\n[SETUP] Embeddings prefix: {PREFIX}")
     print(f"[SETUP] Text embeddings:   {TEXT_EMB_PATH}")
@@ -221,9 +301,115 @@ def main():
         print(f"[SETUP] CSV file:          {CSV_PATH}")
     print(f"[SETUP] Map will be saved to: {MAP_PATH}")
     print(f"[SETUP] k = {K_DEFAULT}, threshold = {THRESHOLD}")
+    print(f"[SETUP] Fusion mode: {FUSION_DEFAULT}")
     print(f"[SETUP] Fusion weights: w_text={W_TEXT}, w_img={W_IMG}")
+    print(f"[SETUP] RRF k: {RRF_K}")
     print(f"[SETUP] VLM family: {args.vlm}")
-    print(f"[SETUP] VLM model:  {vlm_model}\n")
+    print(f"[SETUP] VLM model:  {vlm_model}")
+    print(f"[SETUP] Validate query: {VALIDATE_QUERY!r}")
+    print(f"[SETUP] Validate flag fields: {VALIDATE_FLAG_FIELDS}")
+    print(f"[SETUP] Validate K list: {VALIDATE_K_LIST}\n")
+
+    ###################
+    # ----- Utils -----
+    ###################
+
+    def minmax(xs):
+        if not xs:
+            return []
+        lo, hi = min(xs), max(xs)
+        if hi - lo < 1e-8:
+            return [0.0 for _ in xs]
+        return [(x - lo) / (hi - lo) for x in xs]
+
+    def minmax_dict(score_dict):
+        if not score_dict:
+            return {}
+
+        values = list(score_dict.values())
+        lo, hi = min(values), max(values)
+
+        if hi - lo < 1e-8:
+            return {k: 0.0 for k in score_dict}
+
+        return {
+            k: (v - lo) / (hi - lo)
+            for k, v in score_dict.items()
+        }
+
+    def normalize_id(x):
+        if pd.isna(x):
+            return None
+        s = str(x).strip()
+        try:
+            f = float(s)
+            if f.is_integer():
+                s = str(int(f))
+        except ValueError:
+            pass
+        return s
+
+    def build_tree_relevance_set_from_table(meta, df, flag_fields, id_field="ID"):
+        df = df.copy()
+        df.columns = [str(c).strip().lower() for c in df.columns]
+
+        id_field_norm = str(id_field).strip().lower()
+        flag_fields_norm = [str(f).strip().lower() for f in flag_fields]
+
+        if id_field_norm not in df.columns:
+            raise ValueError(
+                f"ID field {id_field!r} not found in dataframe columns: {df.columns.tolist()}"
+            )
+
+        present_flag_fields = [f for f in flag_fields_norm if f in df.columns]
+
+        if not present_flag_fields:
+            raise ValueError(
+                f"None of the requested flag fields were found in dataframe.\n"
+                f"Requested: {flag_fields}\n"
+                f"Available: {df.columns.tolist()}"
+            )
+
+        searchable_ids = set()
+        for item in meta:
+            if not has_valid_image(item):
+                continue
+            item_id = normalize_id(item.get("source_id"))
+            if item_id is not None:
+                searchable_ids.add(item_id)
+
+        is_relevant = (
+            df[present_flag_fields]
+            .astype(str)
+            .apply(lambda col: col.str.strip().str.lower())
+            .eq("yes")
+            .any(axis=1)
+        )
+
+        print(f"[VALIDATE] Found {is_relevant.sum()} relevant items using flag fields: {present_flag_fields}")
+
+        relevant_ids = set(
+            df.loc[is_relevant, id_field_norm]
+            .dropna()
+            .map(normalize_id)
+            .dropna()
+        )
+
+        print(f"[VALIDATE] Relevant IDs before searchable filter: {len(relevant_ids)}")
+        print(f"[VALIDATE] Searchable IDs from meta: {len(searchable_ids)}")
+
+        overlap = relevant_ids.intersection(searchable_ids)
+        print(f"[VALIDATE] Found {len(overlap)} unique relevant items.")
+
+        print("[DEBUG] Sample relevant_ids:", list(relevant_ids)[:20])
+        print("[DEBUG] Sample searchable_ids:", list(searchable_ids)[:20])
+        print("[DEBUG] relevant_id types:", {type(x).__name__ for x in list(relevant_ids)[:20]})
+        print("[DEBUG] searchable_id types:", {type(x).__name__ for x in list(searchable_ids)[:20]})
+
+        return searchable_ids, overlap
+
+    def reciprocal_rank(rank, rrf_k):
+        return 1.0 / (rrf_k + rank)
 
     # -------------------------
     # Load embeddings + meta
@@ -335,7 +521,16 @@ def main():
     # -------------------------
     # Multimodal search
     # -------------------------
-    def search_multimodal(query: str, k: int, threshold: float, w_text: float, w_img: float):
+    def search_multimodal(
+        query: str,
+        k: int,
+        threshold: float,
+        w_text: float,
+        w_img: float,
+        fusion_type: str,
+        rrf_k: int,
+        make_plots: bool = True,
+    ):
         qv_t = embed_query_text(query)
         qv_i = embed_query_img(query)
 
@@ -353,11 +548,13 @@ def main():
                 f"Make sure --vlm/--vl_model matches the model used to create the embeddings."
             )
 
-        D_t, I_t = index_text.search(qv_t, k)
+        k_search = max(1, min(int(k), len(meta)))
+
+        D_t, I_t = index_text.search(qv_t, k_search)
         scores_t = D_t[0]
         idxs_t = I_t[0]
 
-        D_i, I_i = index_img.search(qv_i, k)
+        D_i, I_i = index_img.search(qv_i, k_search)
         scores_i = D_i[0]
         idxs_i = I_i[0]
 
@@ -372,10 +569,57 @@ def main():
             if idx >= 0
         }
 
+        rank_text_dict = {
+            int(idx): rank
+            for rank, idx in enumerate(idxs_t, start=1)
+            if idx >= 0
+        }
+        rank_img_dict = {
+            int(idx): rank
+            for rank, idx in enumerate(idxs_i, start=1)
+            if idx >= 0
+        }
+
         candidate_idxs = set(score_text_dict.keys()).union(score_img_dict.keys())
 
         text_scores = sorted(score_text_dict.values())
         img_scores = sorted(score_img_dict.values())
+        norm_text_dict = minmax_dict(score_text_dict)
+        norm_img_dict = minmax_dict(score_img_dict)
+
+        text_norm_scores = sorted(norm_text_dict.values())
+        img_norm_scores = sorted(norm_img_dict.values())
+
+        if make_plots:
+            save_dir = os.path.dirname(PLOTS_PATH) or "."
+
+            plt.figure()
+            plt.hist(text_scores, bins=30, alpha=0.6, label="Text scores")
+            plt.hist(img_scores, bins=30, alpha=0.6, label="Image scores")
+            plt.legend()
+            plt.title(f"Raw score distributions\n{query}")
+            plt.xlabel("Score")
+            plt.ylabel("Frequency")
+            raw_path = os.path.join(save_dir, "hist_raw_scores.png")
+            plt.savefig(raw_path)
+            plt.close()
+
+            text_norm = minmax(text_scores)
+            img_norm = minmax(img_scores)
+
+            plt.figure()
+            plt.hist(text_norm, bins=30, alpha=0.6, label="Text (norm)")
+            plt.hist(img_norm, bins=30, alpha=0.6, label="Image (norm)")
+            plt.legend()
+            plt.title(f"Normalized score distributions\n{query}")
+            plt.xlabel("Normalized score")
+            plt.ylabel("Frequency")
+            norm_path = os.path.join(save_dir, "hist_norm_scores.png")
+            plt.savefig(norm_path)
+            plt.close()
+
+            print(f"[PLOT] Saved raw scores to: {raw_path}")
+            print(f"[PLOT] Saved normalized scores to: {norm_path}")
 
         def get_percentile(score, scores_list):
             if not scores_list:
@@ -393,13 +637,30 @@ def main():
                 skipped_no_image += 1
                 continue
 
-            st = score_text_dict.get(idx, 0.0)
-            si = score_img_dict.get(idx, 0.0)
+            st = norm_text_dict.get(idx, 0.0)
+            si = norm_img_dict.get(idx, 0.0)
 
-            p_text = 100.0 * get_percentile(st, text_scores)
-            p_img = 100.0 * get_percentile(si, img_scores)
+            p_text = 100.0 * get_percentile(st, text_norm_scores)
+            p_img = 100.0 * get_percentile(si, img_norm_scores)
 
-            s = w_text * st + w_img * si
+            rt = rank_text_dict.get(idx)
+            ri = rank_img_dict.get(idx)
+
+            if fusion_type == "weighted":
+                s = w_text * st + w_img * si
+            elif fusion_type == "text":
+                s = st
+            elif fusion_type == "image":
+                s = si
+            elif fusion_type == "rrf":
+                s = 0.0
+                if rt is not None:
+                    s += reciprocal_rank(rt, rrf_k)
+                if ri is not None:
+                    s += reciprocal_rank(ri, rrf_k)
+            else:
+                raise ValueError(f"Unsupported fusion type: {fusion_type}")
+
             if s < threshold:
                 continue
 
@@ -410,7 +671,7 @@ def main():
         fused.sort(key=lambda x: x[1], reverse=True)
 
         results = []
-        for idx, s_fused, st, si, p_text, p_img in fused[:k]:
+        for idx, s_fused, st, si, p_text, p_img in fused[:k_search]:
             item = meta[idx]
             results.append(
                 {
@@ -421,6 +682,7 @@ def main():
                     "p_text": float(p_text),
                     "p_img": float(p_img),
                     "id": item["id"],
+                    "source_id": item.get("source_id", item["id"]),
                     "text": item.get("text", ""),
                     "lat": float(item["lat"]),
                     "lon": float(item["lon"]),
@@ -429,6 +691,106 @@ def main():
             )
 
         return results
+
+    # -------------------------
+    # Validation helpers
+    # -------------------------
+    def normalized_average_rank(ranks, N, N_rel):
+        if N <= 0 or N_rel <= 0:
+            return None
+        if len(ranks) != N_rel:
+            return None
+        return (sum(ranks) - (N_rel * (N_rel + 1)) / 2.0) / (N * N_rel)
+
+    def run_validation():
+        print("\n[VALIDATE] Running supervised validation...")
+        print(f"[VALIDATE] Query: {VALIDATE_QUERY!r}")
+        print(f"[VALIDATE] Flag fields: {VALIDATE_FLAG_FIELDS}")
+        print(f"[VALIDATE] Fusion mode: {current_fusion}")
+
+        if df is None:
+            print("[VALIDATE] No CSV/XLSX dataframe loaded, so validation cannot run.\n")
+            return
+
+        searchable_ids, relevant_ids = build_tree_relevance_set_from_table(meta, df, VALIDATE_FLAG_FIELDS, id_field="ID")
+
+        N = len(searchable_ids)
+        N_rel = len(relevant_ids)
+
+        print(f"[VALIDATE] Searchable image-backed universe size N = {N}")
+        print(f"[VALIDATE] Relevant tree-labelled items N_rel = {N_rel}")
+
+        if N == 0:
+            print("[VALIDATE] No searchable image-backed items found.\n")
+            return
+
+        if N_rel == 0:
+            print("[VALIDATE] No relevant tree-labelled items found using those flag fields.\n")
+            return
+
+        full_results = search_multimodal(
+            query=VALIDATE_QUERY,
+            k=N,
+            threshold=-1.0,
+            w_text=W_TEXT,
+            w_img=W_IMG,
+            fusion_type=current_fusion,
+            rrf_k=RRF_K,
+            make_plots=True,
+        )
+
+        ranked_ids = [
+            normalize_id(r.get("source_id"))
+            for r in full_results
+            if r.get("source_id") is not None
+        ]
+        rank_lookup = {item_id: rank for rank, item_id in enumerate(ranked_ids, start=1)}
+
+        found_relevant_ids = [item_id for item_id in relevant_ids if item_id in rank_lookup]
+        found_ranks = sorted(rank_lookup[item_id] for item_id in found_relevant_ids)
+
+        print(f"[VALIDATE] Relevant items retrieved in ranking: {len(found_relevant_ids)} / {N_rel}")
+
+        if len(found_relevant_ids) != N_rel:
+            print("[VALIDATE] Warning: not all relevant items were recovered in the ranked results.")
+            print("           Rank* will only be exact when all searchable relevant items are included.")
+
+        rank_star = normalized_average_rank(found_ranks, N=N, N_rel=N_rel) if len(found_relevant_ids) == N_rel else None
+
+        print("\n[VALIDATE] Precision / Recall by K")
+        print("----------------------------------")
+        valid_k_list = sorted(set(min(max(1, k), len(full_results)) for k in VALIDATE_K_LIST))
+        for k_val in valid_k_list:
+            topk_ids = {
+                normalize_id(r.get("source_id"))
+                for r in full_results[:k_val]
+                if r.get("source_id") is not None
+            }
+            hits = len(topk_ids.intersection(relevant_ids))
+            precision_k = hits / k_val
+            recall_k = hits / N_rel
+            print(f"k={k_val:4d}  Precision@k={precision_k:.4f}  Recall@k={recall_k:.4f}  Hits={hits}")
+
+        print("\n[VALIDATE] Rank summary")
+        print("-----------------------")
+        if found_ranks:
+            mean_rank = sum(found_ranks) / len(found_ranks)
+            median_rank = float(np.median(found_ranks))
+            print(f"Mean relevant rank   : {mean_rank:.3f}")
+            print(f"Median relevant rank : {median_rank:.3f}")
+            print(f"Best relevant rank   : {min(found_ranks)}")
+            print(f"Worst relevant rank  : {max(found_ranks)}")
+        else:
+            print("No relevant items were retrieved.")
+
+        if rank_star is not None:
+            print(f"~Rank~               : {rank_star:.6f}")
+            print("Interpretation       : 0 is perfect, ~0.5 is random, closer to 1 is worse")
+        else:
+            print("~Rank~               : not computed exactly")
+            print("Reason               : not all searchable relevant items were present in the ranking")
+
+        print()
 
     # -------------------------
     # Map builder
@@ -457,21 +819,19 @@ def main():
             text = (r["text"] or "")[:200].replace("\n", " ")
             img = r["image"]
             score = r["score"]
-            entry_id = r["id"]
+            entry_id = r["source_id"]
 
             html = f"""
             <div style="width:240px;">
             <b>ID: {entry_id}</b><br>
             <b>Score: {score:.3f}</b><br>
-            <b>Text Score: {r["score_text"]:.3f} (p: {r["p_text"]:.3f} %)</b><br>
-            <b>Image Score: {r["score_img"]:.3f} (p: {r["p_img"]:.3f} %)</b><br>
+            <b>Text Score: {r["score_text"]:.3f} (p: {r["p_text"]:.1f}%)</b><br>
+            <b>Image Score: {r["score_img"]:.3f} (p: {r["p_img"]:.1f}%)</b><br>
             <p style="font-size:11px;">{text}...</p>
             <img src="{img}" width="220">
             </div>
             """
             popup = folium.Popup(html, max_width=260)
-
-            # Show ID directly on the map as tooltip as well
             tooltip = folium.Tooltip(f"ID: {entry_id}")
 
             folium.CircleMarker(
@@ -491,18 +851,21 @@ def main():
     # -------------------------
     print("\n[READY] Enter search queries.")
     print("        Commands:")
-    print("          k=<int>            change number of neighbours")
-    print("          threshold=<float>  change similarity threshold")
-    print("          quit / exit        stop")
+    print("          k=<int>             change number of neighbours")
+    print("          threshold=<float>   change similarity threshold")
+    print("          fusion=<mode>       weighted | rrf | text | image")
+    print("          VALIDATE            run weakly supervised tree validation")
+    print("          quit / exit         stop")
     print()
     print(f"        Map file (overwrite each query): {MAP_PATH}\n")
 
     current_k = K_DEFAULT
     current_threshold = THRESHOLD
+    current_fusion = FUSION_DEFAULT
 
     while True:
         try:
-            q = input(f"Query (k={current_k}, thr={current_threshold})> ").strip()
+            q = input(f"Query (k={current_k}, thr={current_threshold}, fusion={current_fusion})> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n[EXIT]")
             break
@@ -513,6 +876,10 @@ def main():
         if q.lower() in {"q", "quit", "exit"}:
             print("[EXIT]")
             break
+
+        if q.upper() == "VALIDATE":
+            run_validation()
+            continue
 
         if q.startswith("k =") or q.startswith("k="):
             try:
@@ -530,7 +897,21 @@ def main():
                 print("[ERROR] Invalid threshold value.\n")
             continue
 
-        print(f"[SEARCH] Multimodal search (k={current_k}, threshold={current_threshold}) for: {q!r}")
+        if q.startswith("fusion =") or q.startswith("fusion="):
+            try:
+                new_fusion = q.split("=", 1)[1].strip().lower()
+                if new_fusion not in {"weighted", "rrf", "text", "image"}:
+                    raise ValueError("invalid fusion mode")
+                current_fusion = new_fusion
+                print(f"[SET] fusion updated to {current_fusion}\n")
+            except Exception:
+                print("[ERROR] Invalid fusion mode. Use: weighted, rrf, text, image.\n")
+            continue
+
+        print(
+            f"[SEARCH] Search "
+            f"(fusion={current_fusion}, k={current_k}, threshold={current_threshold}) for: {q!r}"
+        )
 
         results = search_multimodal(
             query=q,
@@ -538,6 +919,9 @@ def main():
             threshold=current_threshold,
             w_text=W_TEXT,
             w_img=W_IMG,
+            fusion_type=current_fusion,
+            rrf_k=RRF_K,
+            make_plots=True,
         )
 
         print(f"[SEARCH] Got {len(results)} image-backed results after fusion + threshold.\n")
@@ -567,7 +951,7 @@ def main():
             for r in results:
                 img_url = r.get("image")
                 if img_url:
-                    filename = f"{r['id']}.jpg"
+                    filename = f"{r['source_id']}.jpg"
                     save_path = os.path.join(full_folder_path, filename)
                     if download_image(img_url, save_path):
                         saved_count += 1

@@ -545,7 +545,8 @@ def main():
     print("[DEBUG] Length stats:")
     print(lens.describe())
     print("[DEBUG] Rows with len >= 1:", (lens >= 1).sum())
-
+    print(df.columns.tolist())
+    
     # 2. Fill short descriptions with BLIP
     df = fill_short_descriptions_with_blip(
         df,
@@ -558,7 +559,8 @@ def main():
     texts = df["text"].fillna("").astype(str).tolist()
     texts = [" ".join(t.split()[:50]) for t in texts]  # truncate to ~50 words
     imgs = df["primary_image"].tolist()
-    ids = df["id"].tolist()
+    source_ids = df["source_id"].astype(str).str.strip().tolist()  
+    print(f"[DEBUG] Source IDs: {source_ids[:10]}")
     lats = df["LATITUDE"].tolist()
     lons = df["LONGITUDE"].tolist()
 
@@ -584,15 +586,14 @@ def main():
     # 6. Save metadata
     meta = []
     for i in range(len(df)):
-        meta.append(
-            {
-                "id": ids[i],
-                "text": texts[i],
-                "lat": float(lats[i]),
-                "lon": float(lons[i]),
-                "primary_image": imgs[i],
-            }
-        )
+        meta.append({
+            "id": str(i),                   # internal index
+            "source_id": source_ids[i],      # original CommuniMap record ID
+            "text": texts[i],
+            "primary_image": imgs[i],
+            "lat": lats[i],
+            "lon": lons[i],
+        })
 
     with open(out_prefix + "_meta.json", "w", encoding="utf8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
