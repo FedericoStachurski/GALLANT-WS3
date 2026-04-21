@@ -169,7 +169,7 @@ def load_communimap_data(path, use_blip=False, blip_min_len=40, blip_max_rows=No
     """
     Loads, cleans, and structures CommuniMap spot data into:
 
-        id, text, LATITUDE, LONGITUDE, primary_image
+        id, source_id, text, LATITUDE, LONGITUDE, primary_image
 
     If use_blip=True, rows with missing/very short text but with an image
     will get a BLIP-generated caption used as text.
@@ -182,7 +182,6 @@ def load_communimap_data(path, use_blip=False, blip_min_len=40, blip_max_rows=No
     df = load_raw_dataframe(path)
     print(f"Loaded dataframe: {df.shape[0]} rows, {df.shape[1]} columns")
 
-    # Identify media columns
     media_cols = [c for c in df.columns if c.startswith("MEDIA_")]
 
     needed = {"DESCRIPTION", "LATITUDE", "LONGITUDE", "IMAGE"}
@@ -191,16 +190,13 @@ def load_communimap_data(path, use_blip=False, blip_min_len=40, blip_max_rows=No
         print(f"Warning: Missing expected columns: {missing_cols}")
         raise ValueError("Input CSV missing required columns.")
 
-    # Build the primary_image column
     df["primary_image"] = df.apply(
         lambda row: pick_primary_image(row, media_cols),
         axis=1
     )
 
-    # Initial text from DESCRIPTION
     df["text"] = df["DESCRIPTION"].fillna("").astype(str).str.strip()
 
-    # Optionally use BLIP to fill missing/short text
     if use_blip:
         df = fill_missing_text_with_blip(
             df,
@@ -208,7 +204,6 @@ def load_communimap_data(path, use_blip=False, blip_min_len=40, blip_max_rows=No
             max_rows=blip_max_rows,
         )
 
-    # Drop rows with no coordinates or no usable text
     mask = (
         df["LATITUDE"].notna()
         & df["LONGITUDE"].notna()
@@ -216,11 +211,16 @@ def load_communimap_data(path, use_blip=False, blip_min_len=40, blip_max_rows=No
 
     clean = df[mask].copy().reset_index(drop=True)
 
-    # Create id column (if no id exists)
+    # Preserve original source ID if available
+    if "ID" in clean.columns:
+        clean["source_id"] = clean["ID"].astype(str).str.strip()
+    else:
+        clean["source_id"] = clean.index.astype(str)
+
+    # Optional internal embedding/local row ID
     clean["id"] = clean.index.astype(str)
 
-    # Keep only columns needed downstream
-    clean = clean[["id", "text", "LATITUDE", "LONGITUDE", "primary_image"]]
+    clean = clean[["id", "source_id", "text", "LATITUDE", "LONGITUDE", "primary_image"]]
 
     print(f"Cleaned dataset: {clean.shape[0]} usable rows.")
     return clean
